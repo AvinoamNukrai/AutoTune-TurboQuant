@@ -1,0 +1,18 @@
+# Pinned for reproducibility. TurboQuant KV-cache presets require vLLM >= 0.20
+# (merged upstream in vllm-project/vllm#38479, 2026-04-15).
+# After the Phase-1 smoke test passes, freeze the full environment with:
+#   pip freeze > requirements.lock.txt
+vllm==0.20.2
+
+# Analysis & experiments (harness-side, no GPU needed)
+optuna>=4.0
+pandas>=2.0
+scipy>=1.11
+statsmodels>=0.14
+matplotlib>=3.8
+seaborn>=0.13
+
+# Profiler (Experiment 0) — HF-side capture and simulated quantization
+transformers>=4.48
+datasets>=3.0
+accelerate>=1.0

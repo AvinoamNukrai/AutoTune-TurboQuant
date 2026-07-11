@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.hf_cache/
+logs/
+results/*.json
+results/*.csv
+!results/samples/
+.DS_Store
