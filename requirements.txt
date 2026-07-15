@@ -1,8 +1,11 @@
 # Pinned for reproducibility. TurboQuant KV-cache presets require vLLM >= 0.20
 # (merged upstream in vllm-project/vllm#38479, 2026-04-15).
+# 0.21.0 is the nearest version shipping a prebuilt wheel (0.20.2 is sdist-only,
+# which forces an hour-long CUDA source build). Install with:
+#   pip install --only-binary :all: -r requirements.txt
 # After the Phase-1 smoke test passes, freeze the full environment with:
 #   pip freeze > requirements.lock.txt
-vllm==0.20.2
+vllm==0.21.0
 
 # Analysis & experiments (harness-side, no GPU needed)
 optuna>=4.0

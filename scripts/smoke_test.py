@@ -137,6 +137,23 @@ def run_single(args: argparse.Namespace) -> None:
 
 def run_sweep(args: argparse.Namespace) -> None:
     """Parent mode: run each config in a fresh subprocess, aggregate results."""
+    # Preflight: fail fast with a clear message instead of 7 identical failures.
+    try:
+        import vllm  # noqa: PLC0415
+        import torch  # noqa: PLC0415
+    except ModuleNotFoundError as exc:
+        sys.exit(
+            f"PREFLIGHT FAILED: {exc}.\n"
+            f"Interpreter: {sys.executable}\n"
+            "Activate the project venv and install deps first:\n"
+            "  source .venv/bin/activate && pip install -r requirements.txt"
+        )
+    if not torch.cuda.is_available():
+        sys.exit("PREFLIGHT FAILED: torch sees no CUDA GPU on this node "
+                 "(check nvidia-smi / CUDA_VISIBLE_DEVICES / srun --gres).")
+    print(f"Preflight OK: vllm {vllm.__version__}, torch {torch.__version__}, "
+          f"GPU: {torch.cuda.get_device_name(0)}", flush=True)
+
     names = args.configs or list(CONFIGS)
     results = []
     for name in names:
