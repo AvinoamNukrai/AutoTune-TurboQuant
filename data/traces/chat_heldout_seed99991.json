@@ -1,0 +1,167 @@
+{
+ "profile": "chat",
+ "seed": 99991,
+ "n_requests": 40,
+ "requests": [
+  {
+   "prompt": "Describe how semiconductors affects everyday life, with concrete examples.",
+   "max_tokens": 444
+  },
+  {
+   "prompt": "Compare fermentation with the telegraph, covering similarities and differences.",
+   "max_tokens": 283
+  },
+  {
+   "prompt": "Write a short story that illustrates the concept of jet engines.",
+   "max_tokens": 321
+  },
+  {
+   "prompt": "What are the three most important things to understand about coral reefs? Elaborate on each.",
+   "max_tokens": 398
+  },
+  {
+   "prompt": "Describe how monetary policy affects everyday life, with concrete examples.",
+   "max_tokens": 351
+  },
+  {
+   "prompt": "Explain medieval guilds to a high-school student in a few paragraphs.",
+   "max_tokens": 297
+  },
+  {
+   "prompt": "Compare the telegraph with public key cryptography, covering similarities and differences.",
+   "max_tokens": 354
+  },
+  {
+   "prompt": "I'm preparing a lesson about the immune system. Draft an outline with talking points.",
+   "max_tokens": 311
+  },
+  {
+   "prompt": "I'm preparing a lesson about supply and demand. Draft an outline with talking points.",
+   "max_tokens": 331
+  },
+  {
+   "prompt": "Describe how the printing press affects everyday life, with concrete examples.",
+   "max_tokens": 313
+  },
+  {
+   "prompt": "Explain the printing press to a high-school student in a few paragraphs.",
+   "max_tokens": 384
+  },
+  {
+   "prompt": "Write a short story that illustrates the concept of sorting algorithms.",
+   "max_tokens": 257
+  },
+  {
+   "prompt": "Describe how the immune system affects everyday life, with concrete examples.",
+   "max_tokens": 356
+  },
+  {
+   "prompt": "Describe how the printing press affects everyday life, with concrete examples.",
+   "max_tokens": 407
+  },
+  {
+   "prompt": "Write a short story that illustrates the concept of public key cryptography.",
+   "max_tokens": 425
+  },
+  {
+   "prompt": "Explain fermentation to a high-school student in a few paragraphs.",
+   "max_tokens": 221
+  },
+  {
+   "prompt": "Describe how reinforcement learning affects everyday life, with concrete examples.",
+   "max_tokens": 322
+  },
+  {
+   "prompt": "I'm preparing a lesson about medieval guilds. Draft an outline with talking points.",
+   "max_tokens": 266
+  },
+  {
+   "prompt": "What are the three most important things to understand about the Marshall Plan? Elaborate on each.",
+   "max_tokens": 257
+  },
+  {
+   "prompt": "Explain photosynthesis to a high-school student in a few paragraphs.",
+   "max_tokens": 305
+  },
+  {
+   "prompt": "Write a short story that illustrates the concept of monetary policy.",
+   "max_tokens": 201
+  },
+  {
+   "prompt": "Describe how sorting algorithms affects everyday life, with concrete examples.",
+   "max_tokens": 451
+  },
+  {
+   "prompt": "Compare the immune system with sorting algorithms, covering similarities and differences.",
+   "max_tokens": 318
+  },
+  {
+   "prompt": "Describe how monetary policy affects everyday life, with concrete examples.",
+   "max_tokens": 268
+  },
+  {
+   "prompt": "What are the three most important things to understand about the immune system? Elaborate on each.",
+   "max_tokens": 292
+  },
+  {
+   "prompt": "Write a short story that illustrates the concept of medieval guilds.",
+   "max_tokens": 454
+  },
+  {
+   "prompt": "Explain the water cycle to a high-school student in a few paragraphs.",
+   "max_tokens": 441
+  },
+  {
+   "prompt": "I'm preparing a lesson about fermentation. Draft an outline with talking points.",
+   "max_tokens": 394
+  },
+  {
+   "prompt": "Write a short story that illustrates the concept of semiconductors.",
+   "max_tokens": 310
+  },
+  {
+   "prompt": "I'm preparing a lesson about the telegraph. Draft an outline with talking points.",
+   "max_tokens": 292
+  },
+  {
+   "prompt": "Explain ocean currents to a high-school student in a few paragraphs.",
+   "max_tokens": 340
+  },
+  {
+   "prompt": "Write a short story that illustrates the concept of antibiotic resistance.",
+   "max_tokens": 383
+  },
+  {
+   "prompt": "Compare photosynthetic bacteria with medieval guilds, covering similarities and differences.",
+   "max_tokens": 497
+  },
+  {
+   "prompt": "Explain reinforcement learning to a high-school student in a few paragraphs.",
+   "max_tokens": 205
+  },
+  {
+   "prompt": "Describe how medieval guilds affects everyday life, with concrete examples.",
+   "max_tokens": 242
+  },
+  {
+   "prompt": "Explain volcanic eruptions to a high-school student in a few paragraphs.",
+   "max_tokens": 337
+  },
+  {
+   "prompt": "Write a short story that illustrates the concept of the immune system.",
+   "max_tokens": 435
+  },
+  {
+   "prompt": "Explain the French Revolution to a high-school student in a few paragraphs.",
+   "max_tokens": 480
+  },
+  {
+   "prompt": "Describe how the water cycle affects everyday life, with concrete examples.",
+   "max_tokens": 450
+  },
+  {
+   "prompt": "Explain ocean currents to a high-school student in a few paragraphs.",
+   "max_tokens": 288
+  }
+ ]
+}

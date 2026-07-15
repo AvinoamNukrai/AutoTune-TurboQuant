@@ -1,0 +1,167 @@
+{
+ "profile": "chat",
+ "seed": 20260714,
+ "n_requests": 40,
+ "requests": [
+  {
+   "prompt": "Compare supply and demand with jet engines, covering similarities and differences.",
+   "max_tokens": 270
+  },
+  {
+   "prompt": "I'm preparing a lesson about volcanic eruptions. Draft an outline with talking points.",
+   "max_tokens": 228
+  },
+  {
+   "prompt": "Compare volcanic eruptions with neural networks, covering similarities and differences.",
+   "max_tokens": 320
+  },
+  {
+   "prompt": "What are the three most important things to understand about ocean currents? Elaborate on each.",
+   "max_tokens": 398
+  },
+  {
+   "prompt": "Describe how Roman aqueducts affects everyday life, with concrete examples.",
+   "max_tokens": 470
+  },
+  {
+   "prompt": "Write a short story that illustrates the concept of medieval guilds.",
+   "max_tokens": 479
+  },
+  {
+   "prompt": "Describe how the immune system affects everyday life, with concrete examples.",
+   "max_tokens": 283
+  },
+  {
+   "prompt": "I'm preparing a lesson about black holes. Draft an outline with talking points.",
+   "max_tokens": 382
+  },
+  {
+   "prompt": "Explain the Great Depression to a high-school student in a few paragraphs.",
+   "max_tokens": 476
+  },
+  {
+   "prompt": "Write a short story that illustrates the concept of the printing press.",
+   "max_tokens": 375
+  },
+  {
+   "prompt": "Explain supply and demand to a high-school student in a few paragraphs.",
+   "max_tokens": 388
+  },
+  {
+   "prompt": "Compare DNA replication with supply and demand, covering similarities and differences.",
+   "max_tokens": 232
+  },
+  {
+   "prompt": "Describe how the immune system affects everyday life, with concrete examples.",
+   "max_tokens": 497
+  },
+  {
+   "prompt": "Write a short story that illustrates the concept of ocean currents.",
+   "max_tokens": 376
+  },
+  {
+   "prompt": "Compare antibiotic resistance with neural networks, covering similarities and differences.",
+   "max_tokens": 334
+  },
+  {
+   "prompt": "Explain supply and demand to a high-school student in a few paragraphs.",
+   "max_tokens": 433
+  },
+  {
+   "prompt": "Write a short story that illustrates the concept of monetary policy.",
+   "max_tokens": 253
+  },
+  {
+   "prompt": "Compare fermentation with medieval guilds, covering similarities and differences.",
+   "max_tokens": 263
+  },
+  {
+   "prompt": "Describe how jet engines affects everyday life, with concrete examples.",
+   "max_tokens": 461
+  },
+  {
+   "prompt": "I'm preparing a lesson about the telegraph. Draft an outline with talking points.",
+   "max_tokens": 306
+  },
+  {
+   "prompt": "What are the three most important things to understand about antibiotic resistance? Elaborate on each.",
+   "max_tokens": 251
+  },
+  {
+   "prompt": "Explain the Marshall Plan to a high-school student in a few paragraphs.",
+   "max_tokens": 416
+  },
+  {
+   "prompt": "Compare coral reefs with DNA replication, covering similarities and differences.",
+   "max_tokens": 405
+  },
+  {
+   "prompt": "Describe how Roman aqueducts affects everyday life, with concrete examples.",
+   "max_tokens": 247
+  },
+  {
+   "prompt": "I'm preparing a lesson about binary search trees. Draft an outline with talking points.",
+   "max_tokens": 492
+  },
+  {
+   "prompt": "Compare neural networks with plate tectonics, covering similarities and differences.",
+   "max_tokens": 332
+  },
+  {
+   "prompt": "Compare binary search trees with DNA replication, covering similarities and differences.",
+   "max_tokens": 274
+  },
+  {
+   "prompt": "Compare the telegraph with the Silk Road, covering similarities and differences.",
+   "max_tokens": 248
+  },
+  {
+   "prompt": "Describe how monetary policy affects everyday life, with concrete examples.",
+   "max_tokens": 456
+  },
+  {
+   "prompt": "Compare the printing press with game theory, covering similarities and differences.",
+   "max_tokens": 443
+  },
+  {
+   "prompt": "I'm preparing a lesson about semiconductors. Draft an outline with talking points.",
+   "max_tokens": 472
+  },
+  {
+   "prompt": "Explain game theory to a high-school student in a few paragraphs.",
+   "max_tokens": 369
+  },
+  {
+   "prompt": "Describe how black holes affects everyday life, with concrete examples.",
+   "max_tokens": 316
+  },
+  {
+   "prompt": "Describe how ocean currents affects everyday life, with concrete examples.",
+   "max_tokens": 453
+  },
+  {
+   "prompt": "What are the three most important things to understand about the printing press? Elaborate on each.",
+   "max_tokens": 389
+  },
+  {
+   "prompt": "I'm preparing a lesson about game theory. Draft an outline with talking points.",
+   "max_tokens": 340
+  },
+  {
+   "prompt": "Write a short story that illustrates the concept of public key cryptography.",
+   "max_tokens": 217
+  },
+  {
+   "prompt": "What are the three most important things to understand about Roman aqueducts? Elaborate on each.",
+   "max_tokens": 349
+  },
+  {
+   "prompt": "Compare black holes with antibiotic resistance, covering similarities and differences.",
+   "max_tokens": 433
+  },
+  {
+   "prompt": "Explain DNA replication to a high-school student in a few paragraphs.",
+   "max_tokens": 475
+  }
+ ]
+}
