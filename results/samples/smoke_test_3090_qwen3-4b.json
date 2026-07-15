@@ -1,0 +1,168 @@
+{
+  "model": "Qwen/Qwen3-4B",
+  "gpu": "NVIDIA GeForce RTX 3090",
+  "results": [
+    {
+      "name": "auto",
+      "config": {
+        "kv_cache_dtype": "auto",
+        "skip_layers": null
+      },
+      "ok": true,
+      "engine_load_s": 226.4,
+      "effective_skip_layers": [],
+      "effective_cache_dtype": "auto",
+      "short_gen_s": 2.06,
+      "short_gen_tok_per_s": 497.6,
+      "sample_output": " The explanation should be in the style of a 10-year-old. Also, include a fun fact about the color of the sky at different times of the day. \n\nOkay, so the sky is blue because of something called Rayl",
+      "empty_outputs": 0,
+      "distinct_outputs": 8,
+      "long_prefill_gen_s": 0.76,
+      "long_answer": "The quick brown fox jumps over the lazy dog near the riverbank while engineers b",
+      "long_answer_mentions_fox": true,
+      "peak_vram_gb": 0.0,
+      "subprocess_wall_s": 245.0
+    },
+    {
+      "name": "turboquant_k8v4",
+      "ok": false,
+      "error": "pts/smoke_test.py\", line 90, in run_single\n    llm = LLM(**engine_kwargs)\n          ^^^^^^^^^^^^^^^^^^^^\n  File \"/home/nukraia/.conda/envs/autotune/lib/python3.11/site-packages/vllm/entrypoints/llm.py\", line 381, in __init__\n    self.llm_engine = LLMEngine.from_engine_args(\n                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/nukraia/.conda/envs/autotune/lib/python3.11/site-packages/vllm/v1/engine/llm_engine.py\", line 170, in from_engine_args\n    return cls(\n           ^^^^\n  File \"/home/nukraia/.conda/envs/autotune/lib/python3.11/site-packages/vllm/v1/engine/llm_engine.py\", line 104, in __init__\n    self.engine_core = EngineCoreClient.make_client(\n                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/nukraia/.conda/envs/autotune/lib/python3.11/site-packages/vllm/v1/engine/core_client.py\", line 101, in make_client\n    return SyncMPClient(vllm_config, executor_class, log_stats)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/nukraia/.conda/envs/autotune/lib/python3.11/site-packages/vllm/tracing/otel.py\", line 178, in sync_wrapper\n    return func(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/nukraia/.conda/envs/autotune/lib/python3.11/site-packages/vllm/v1/engine/core_client.py\", line 723, in __init__\n    super().__init__(\n  File \"/home/nukraia/.conda/envs/autotune/lib/python3.11/site-packages/vllm/v1/engine/core_client.py\", line 535, in __init__\n    with launch_core_engines(\n  File \"/home/nukraia/.conda/envs/autotune/lib/python3.11/contextlib.py\", line 144, in __exit__\n    next(self.gen)\n  File \"/home/nukraia/.conda/envs/autotune/lib/python3.11/site-packages/vllm/v1/engine/utils.py\", line 1128, in launch_core_engines\n    wait_for_engine_startup(\n  File \"/home/nukraia/.conda/envs/autotune/lib/python3.11/site-packages/vllm/v1/engine/utils.py\", line 1187, in wait_for_engine_startup\n    raise RuntimeError(\nRuntimeError: Engine core initialization failed. See root cause above. Failed core proc(s): {}\n",
+      "subprocess_wall_s": 87.3
+    },
+    {
+      "name": "turboquant_4bit_nc",
+      "config": {
+        "kv_cache_dtype": "turboquant_4bit_nc",
+        "skip_layers": null
+      },
+      "ok": true,
+      "engine_load_s": 85.26,
+      "effective_skip_layers": [
+        "0",
+        "1",
+        "34",
+        "35"
+      ],
+      "effective_cache_dtype": "turboquant_4bit_nc",
+      "short_gen_s": 2.19,
+      "short_gen_tok_per_s": 467.0,
+      "sample_output": " The sky appears blue due to a phenomenon called Rayleigh scattering, where shorter wavelengths of light (blue and violet) are scattered more efficiently by the molecules and small particles in the Ea",
+      "empty_outputs": 0,
+      "distinct_outputs": 8,
+      "long_prefill_gen_s": 0.78,
+      "long_answer": "The quick brown fox jumps over the lazy dog near the riverbank while engineers b",
+      "long_answer_mentions_fox": true,
+      "peak_vram_gb": 0.0,
+      "subprocess_wall_s": 104.1
+    },
+    {
+      "name": "turboquant_k3v4_nc",
+      "config": {
+        "kv_cache_dtype": "turboquant_k3v4_nc",
+        "skip_layers": null
+      },
+      "ok": true,
+      "engine_load_s": 84.2,
+      "effective_skip_layers": [
+        "0",
+        "1",
+        "34",
+        "35"
+      ],
+      "effective_cache_dtype": "turboquant_k3v4_nc",
+      "short_gen_s": 2.19,
+      "short_gen_tok_per_s": 468.6,
+      "sample_output": " The explanation should be in the style of a child's book, with simple language and a clear, logical sequence of ideas. Also, include a fun fact at the end. \n\nOkay, so the sky is blue because of somet",
+      "empty_outputs": 0,
+      "distinct_outputs": 8,
+      "long_prefill_gen_s": 0.79,
+      "long_answer": "The quick brown fox jumps over the lazy dog near the riverbank while engineers b",
+      "long_answer_mentions_fox": true,
+      "peak_vram_gb": 0.0,
+      "subprocess_wall_s": 103.1
+    },
+    {
+      "name": "turboquant_3bit_nc",
+      "config": {
+        "kv_cache_dtype": "turboquant_3bit_nc",
+        "skip_layers": null
+      },
+      "ok": true,
+      "engine_load_s": 83.71,
+      "effective_skip_layers": [
+        "0",
+        "1",
+        "34",
+        "35"
+      ],
+      "effective_cache_dtype": "turboquant_3bit_nc",
+      "short_gen_s": 2.2,
+      "short_gen_tok_per_s": 466.3,
+      "sample_output": " The sky appears blue due to a phenomenon called Rayleigh scattering. When sunlight, which is white light composed of different colors, enters the Earth's atmosphere, the shorter wavelengths of light ",
+      "empty_outputs": 0,
+      "distinct_outputs": 8,
+      "long_prefill_gen_s": 0.8,
+      "long_answer": "The quick brown fox jumps over the lazy dog near the riverbank while engineers b",
+      "long_answer_mentions_fox": true,
+      "peak_vram_gb": 0.0,
+      "subprocess_wall_s": 102.5
+    },
+    {
+      "name": "3bit_nc_extra_skip",
+      "config": {
+        "kv_cache_dtype": "turboquant_3bit_nc",
+        "skip_layers": [
+          "10",
+          "11"
+        ]
+      },
+      "ok": true,
+      "engine_load_s": 83.8,
+      "effective_skip_layers": [
+        "0",
+        "1",
+        "10",
+        "11",
+        "34",
+        "35"
+      ],
+      "effective_cache_dtype": "turboquant_3bit_nc",
+      "short_gen_s": 2.21,
+      "short_gen_tok_per_s": 464.2,
+      "sample_output": " The explanation should be in the way of a child's explanation, simple and clear. Also, shorter than the one in the example. So, the example is: \"The sky is blue because the atmosphere scatters sunlig",
+      "empty_outputs": 0,
+      "distinct_outputs": 8,
+      "long_prefill_gen_s": 0.79,
+      "long_answer": "The quick brown fox jumps over the lazy dog near the riverbank while engineers b",
+      "long_answer_mentions_fox": true,
+      "peak_vram_gb": 0.0,
+      "subprocess_wall_s": 102.7
+    },
+    {
+      "name": "3bit_nc_try_no_skip",
+      "config": {
+        "kv_cache_dtype": "turboquant_3bit_nc",
+        "skip_layers": []
+      },
+      "ok": true,
+      "engine_load_s": 56.18,
+      "effective_skip_layers": [
+        "0",
+        "1",
+        "34",
+        "35"
+      ],
+      "effective_cache_dtype": "turboquant_3bit_nc",
+      "short_gen_s": 2.22,
+      "short_gen_tok_per_s": 460.4,
+      "sample_output": " The sky appears blue due to a phenomenon called Rayleigh scattering. When sunlight, which is white light composed of different colors, enters the Earth's atmosphere, the shorter wavelengths of light ",
+      "empty_outputs": 0,
+      "distinct_outputs": 8,
+      "long_prefill_gen_s": 0.8,
+      "long_answer": "The quick brown fox jumps over the lazy dog near the riverbank while engineers b",
+      "long_answer_mentions_fox": true,
+      "peak_vram_gb": 0.0,
+      "subprocess_wall_s": 75.2
+    }
+  ]
+}
