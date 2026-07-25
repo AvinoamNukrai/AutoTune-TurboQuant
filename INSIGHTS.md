@@ -94,6 +94,45 @@ vs. `turboquant_3bit_nc`, both rep 0 on RTX 4090.
     (28 cells × 2 reps × ~85 s) ≈ 1.3 GPU-hours — well within the 8–12 h
     allocation.
 
+## Experiment 0 — Layer sensitivity profiler, Qwen3-4B (2026-07-25)
+
+Source: `src/profiler.py --mode full`, HuggingFace Transformers (not vLLM),
+8 WikiText calibration docs, 4 eval docs, 3-bit keys / 4-bit values,
+chunked PPL with 256-token chunks. Results in `results/exp0/`.
+
+22. **Layer 0 is 10× more sensitive than any other layer** (ΔPPL=+4.59 vs.
+    next-worst layer 34 at +0.24). quant_error=6.84 vs ~0.15 median. Layer 0
+    must always be protected regardless of budget.
+23. **`simulated_quant_error` is the only feature that predicts sensitivity**
+    (Spearman ρ=+0.40, p=0.016). The other four candidates — key outlier
+    fraction, post-WHT excess kurtosis, key-norm CV, value dynamic range — all
+    fail (p>0.10). This is because TurboQuant's Hadamard rotation specifically
+    neutralizes the outlier/kurtosis properties those features measure.
+24. **vLLM's positional protection is suboptimal on Qwen3-4B.** The fixed
+    "first 2 + last 2" rule protects {0,1,34,35}. Layer 1 is insensitive
+    (ΔPPL=+0.01), wasting budget. Layers 30-33 are sensitive (ΔPPL=+0.07
+    to +0.15) but unprotected. A statistics-guided policy protecting
+    {0,32,33,34} at the same 4-layer budget covers 3× more ΔPPL.
+25. **Layer 5 breaks the correlation** — second-highest quant_error (0.85) but
+    zero sensitivity (ΔPPL=-0.007). The quantization damage doesn't propagate
+    downstream, likely because early layers have enough residual capacity to
+    compensate. This limits single-feature prediction to ρ≈0.4.
+26. **Correct Lloyd-Max centroids matter.** Initial hardcoded centroids (wrong
+    3-bit values, only 12/16 for 4-bit) gave ρ=0.50. Switching to dynamically
+    computed centroids via the iterative Lloyd-Max algorithm for N(0,1) dropped
+    it to ρ=0.40 — the earlier "better" result was an artifact of wrong math.
+27. **Value dynamic range increases monotonically with depth** — from 0.24
+    (layer 0) to 26.3 (layer 34), dropping to 18.0 at layer 35. Despite this
+    100× spread, it doesn't correlate with sensitivity (ρ=+0.24, p=0.15),
+    because TurboQuant uses per-vector min-max scaling that absorbs range.
+28. **Some mid-layers show negative ΔPPL** (layers 18, 20: ΔPPL=-0.08, -0.04).
+    Quantization acts as regularization — the added noise slightly improves
+    generalization on the eval set. Not reproducible across seeds; noise floor.
+29. **Modern transformers (4.48+) uses `DynamicLayer` cache API**, not the older
+    `DynamicCache.key_cache`/`value_cache` lists. Cache entries are accessed via
+    `past_kv.layers[i].keys` / `.values`. Iteration yields 3-tuples, not
+    2-tuples.
+
 ## Methodology / infrastructure lessons
 
 9. **vLLM v1 is multi-process**: `torch.cuda.max_memory_allocated()` in the
