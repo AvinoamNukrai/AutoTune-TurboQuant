@@ -133,6 +133,44 @@ chunked PPL with 256-token chunks. Results in `results/exp0/`.
     `past_kv.layers[i].keys` / `.values`. Iteration yields 3-tuples, not
     2-tuples.
 
+## Experiment 1 — Screening grid, Qwen3-4B, RTX 4090 (2026-07-25)
+
+Source: `src/harness.py --manifest configs/grids/exp1.json`, vLLM 0.21.0
+engine, 34 cells = 5 kv_cache_dtype × 4 protection sets × 2 reps.
+Protection sets: floor (vLLM default {0,1,34,35}), pos_n4 (+{2,3,32,33}),
+stat_b8 (+{4,5,8,33} from Exp 0 ranking), stat_b6 (+{5,33}).
+Results in `results/cells/`.
+
+30. **Preset selection dominates layer protection.** The PPL gap between best
+    TQ preset (k8v4, 10.34 — matching baseline 10.35) and worst (3bit_nc/floor,
+    10.70 — +3.4%) is 0.36 PPL. Layer protection at best recovers 0.09 PPL
+    (3bit_nc stat_b8 vs floor). AutoTune's main practical value is automated
+    preset selection, not layer protection fine-tuning.
+31. **k8v4 achieves zero PPL degradation** (10.34 vs 10.35 baseline, within
+    noise) at +9% TPOT overhead. FP8 keys are effectively lossless; 4-bit
+    uniform values cause negligible damage. However, k8v4 requires Ada/Hopper
+    (fails on Ampere — finding #6), so hardware-aware selection is essential.
+32. **Layer protection scales with quantization aggressiveness.** On 3bit_nc
+    and k3v4_nc, protecting 4 extra layers (stat_b8) recovers ~0.09 PPL
+    (~25% of the degradation). On 4bit_nc and k8v4, protection adds <0.01 PPL
+    because per-layer damage is already negligible. Optimal protection budget
+    is preset-dependent.
+33. **Stats-guided ≈ positional protection on PPL** at the same 8-layer budget.
+    Differences are 0.003–0.031 PPL, within noise at 2 reps. However,
+    stats-guided fixes k8v4/floor's needle accuracy drop (0.95 → 1.00),
+    suggesting it protects the right layers for retrieval tasks even when
+    PPL differences are marginal.
+34. **TPOT overhead is monotonic with compression aggressiveness**: k8v4 +9%,
+    4bit_nc +13–15%, k3v4_nc +16–18%, 3bit_nc +16–19% vs FP16 baseline.
+    More compressed cache = more dequantization work per decode step.
+35. **TTFT is too noisy for comparison at 2 reps.** Cold-start effects
+    (CUDA graph compilation, first engine load) cause 10× variance between
+    reps (e.g., 817ms vs 76ms). Needs more reps or warm-up runs to be
+    reliable.
+36. **Needle accuracy is robust across all configs** — 1.00 (20/20) everywhere
+    except k8v4/floor (0.95) and one 3bit_nc/stat_b6 rep (0.95). KV-cache
+    quantization does not break simple retrieval even at aggressive settings.
+
 ## Methodology / infrastructure lessons
 
 9. **vLLM v1 is multi-process**: `torch.cuda.max_memory_allocated()` in the
