@@ -115,7 +115,8 @@ def _classify_protection(skip: list, ranking: list[int]) -> tuple[str, int]:
     return "positional", len(skip_set)
 
 
-def load_cells(cells_dir: Path, ranking: list[int]) -> list[CellMetrics]:
+def load_cells(cells_dir: Path, ranking: list[int],
+               include_positional: bool = False) -> list[CellMetrics]:
     results = []
     for f in sorted(cells_dir.glob("*.json")):
         data = json.loads(f.read_text())
@@ -128,6 +129,8 @@ def load_cells(cells_dir: Path, ranking: list[int]) -> list[CellMetrics]:
         preset = dtype.replace("turboquant_", "")
         skip = cfg.get("skip_layers", [])
         method, n_protect = _classify_protection(skip, ranking)
+        if method == "positional" and not include_positional:
+            continue
 
         chat = data.get("profiles", {}).get("chat", {})
         rag = data.get("profiles", {}).get("rag", {})
@@ -307,6 +310,58 @@ def analyze(cells_dir: Path, ranking: list[int]):
         else:
             print(f"\n  >>> No viable config for {profile}")
 
+    # --- Protection value analysis (ignoring PPL constraint) ---
+    print(f"\n{'=' * 90}")
+    print("PROTECTION VALUE ANALYSIS (no PPL constraint — isolating protection effect)")
+    print(f"{'=' * 90}")
+    print(f"\n  For each preset, how much does protection improve PPL and what does it cost?")
+    print(f"  {'preset':<10} {'budget':>6} {'PPL':>7} {'ΔPPL_vs_floor':>14} "
+          f"{'R_mem':>5} {'ΔR_mem':>7} {'needle':>6}")
+    print(f"  {'-' * 70}")
+
+    for preset in PRESETS:
+        preset_rows = sorted(
+            [r for r in averaged if r["preset"] == preset],
+            key=lambda r: r["n_protect"],
+        )
+        floor_row = next((r for r in preset_rows if r["n_protect"] == 0), None)
+        if not floor_row or not floor_row["ppl"]:
+            continue
+        for r in preset_rows:
+            if not r["ppl"]:
+                continue
+            dppl = floor_row["ppl"] - r["ppl"]
+            rmem_floor = compute_r_mem(preset, 0)
+            rmem_this = compute_r_mem(preset, r["n_protect"])
+            drmem = rmem_this - rmem_floor
+            print(f"  {preset:<10} {r['n_protect']:>6} {fmt(r['ppl']):>7} "
+                  f"{dppl:>+13.3f} {rmem_this:>5.2f} {drmem:>+6.2f}  "
+                  f"{fmt(r.get('needle_acc'), 2):>6}")
+        print()
+
+    # --- Threshold proximity analysis ---
+    print(f"{'=' * 90}")
+    print("THRESHOLD PROXIMITY: configs closest to crossing a PPL threshold")
+    print(f"{'=' * 90}")
+    for profile, pcfg in PROFILES_CFG.items():
+        threshold = baseline["ppl"] * (1 + pcfg["ppl_threshold"])
+        near = []
+        for r in averaged:
+            if r["ppl"] is None:
+                continue
+            gap = r["ppl"] - threshold
+            if 0 < gap < 0.3:
+                near.append((r, gap))
+        near.sort(key=lambda x: x[1])
+        if near:
+            print(f"\n  {profile.upper()} threshold: PPL ≤ {threshold:.2f}")
+            for r, gap in near[:4]:
+                print(f"    {r['preset']:<10} n_prot={r['n_protect']}  "
+                      f"PPL={fmt(r['ppl'])}  gap={gap:+.3f}  "
+                      f"← needs {gap:.3f} more PPL reduction to pass")
+        else:
+            print(f"\n  {profile.upper()}: no near-miss configs (all either pass or far away)")
+
     return averaged, baseline
 
 
@@ -317,20 +372,45 @@ def analyze(cells_dir: Path, ranking: list[int]):
 def suggest_refinements(cells_dir: Path, ranking: list[int],
                         n_trials: int = 16) -> list[dict]:
     cells = load_cells(cells_dir, ranking)
+    baseline = load_baseline(cells_dir)
+    averaged = average_cells(cells)
     existing = {(c.preset, c.n_protect) for c in cells}
 
-    candidates = []
+    priority = []
+    for preset in PRESETS:
+        preset_rows = [r for r in averaged if r["preset"] == preset]
+        floor_row = next((r for r in preset_rows if r["n_protect"] == 0), None)
+        if not floor_row or not floor_row["ppl"]:
+            continue
+        for profile, pcfg in PROFILES_CFG.items():
+            threshold = baseline["ppl"] * (1 + pcfg["ppl_threshold"])
+            if floor_row["ppl"] > threshold:
+                best_protected = min(
+                    (r["ppl"] for r in preset_rows if r["n_protect"] > 0 and r["ppl"]),
+                    default=floor_row["ppl"],
+                )
+                gap = best_protected - threshold
+                if gap < 0.2:
+                    for budget in range(1, min(9, len(ranking) + 1)):
+                        if (preset, budget) not in existing:
+                            priority.append((gap, preset, budget))
+
+    priority.sort()
+
+    all_candidates = []
+    seen = set()
+    for _, preset, budget in priority:
+        if (preset, budget) not in seen:
+            all_candidates.append((preset, budget))
+            seen.add((preset, budget))
+
     for preset in PRESETS:
         for budget in range(0, min(9, len(ranking) + 1)):
-            if (preset, budget) not in existing:
-                candidates.append((preset, budget))
+            if (preset, budget) not in existing and (preset, budget) not in seen:
+                all_candidates.append((preset, budget))
+                seen.add((preset, budget))
 
-    candidates.sort(key=lambda x: (
-        PRESETS.index(x[0]),
-        abs(x[1] - 3),
-    ))
-
-    selected = candidates[:n_trials // 2]
+    selected = all_candidates[:n_trials // 2]
 
     manifest = []
     for preset, budget in selected:
@@ -341,6 +421,13 @@ def suggest_refinements(cells_dir: Path, ranking: list[int],
                 "skip_layers": skip,
                 "rep": rep,
             })
+
+    print(f"Prioritized configs (threshold-crossing candidates first):")
+    for preset, budget in selected:
+        tag = " ← near threshold" if any(
+            p == preset and b == budget for _, p, b in priority
+        ) else ""
+        print(f"  {preset} budget={budget} skip={skip_layers_for_budget(ranking, budget)}{tag}")
 
     return manifest
 
