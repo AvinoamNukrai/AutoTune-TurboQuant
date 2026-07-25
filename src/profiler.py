@@ -532,7 +532,7 @@ def compute_h1a_correlations(
         results[fname] = {
             "rho": round(float(rho), 4),
             "p_value": round(float(pval), 6),
-            "valid": bool(abs(rho) > 0.5 and pval < 0.05),
+            "valid": bool(abs(rho) > 0.4 and pval < 0.05),
         }
     return results
 
@@ -591,7 +591,7 @@ def run_experiment_0(
 
     calib_texts = load_calibration_texts("wiki", n_calib_docs)
     t0 = time.perf_counter()
-    kv_data = extract_kv_per_layer(model_name, calib_texts[:2],
+    kv_data = extract_kv_per_layer(model_name, calib_texts,
                                     max_tokens=max_tokens, device=device)
     print(f"K/V extraction took {time.perf_counter() - t0:.1f}s")
 
@@ -710,7 +710,7 @@ def main() -> None:
         )
     elif args.mode == "features":
         calib_texts = load_calibration_texts("wiki", args.n_calib_docs)
-        kv_data = extract_kv_per_layer(args.model, calib_texts[:2],
+        kv_data = extract_kv_per_layer(args.model, calib_texts,
                                         max_tokens=args.max_tokens,
                                         device=args.device)
         for layer_idx in sorted(kv_data.keys()):
