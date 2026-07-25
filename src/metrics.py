@@ -103,10 +103,12 @@ class RequestLatency:
 def extract_latencies(outputs) -> list[RequestLatency]:
     """Pull per-request timing out of vLLM RequestOutput.metrics.
 
-    vLLM populates `RequestOutput.metrics` (arrival_time, first_token_time,
-    finished_time) when available; field availability varies by version, so
-    every access is defensive — missing fields degrade to None rather than
-    crashing the cell.
+    vLLM V1 (0.21+) populates `RequestOutput.metrics` as a
+    `RequestStateStats` object with monotonic timestamps and a
+    pre-computed `first_token_latency`. Requires `disable_log_stats=False`.
+
+    V0 used `arrival_time`/`first_token_time`/`finished_time`.
+    Both paths are handled defensively.
     """
     lats = []
     for out in outputs:
@@ -114,13 +116,23 @@ def extract_latencies(outputs) -> list[RequestLatency]:
         m = getattr(out, "metrics", None)
         ttft = e2e = None
         if m is not None:
-            arrival = getattr(m, "arrival_time", None)
-            first_tok = getattr(m, "first_token_time", None)
-            finished = getattr(m, "finished_time", None)
-            if arrival is not None and first_tok is not None:
-                ttft = first_tok - arrival
-            if arrival is not None and finished is not None:
-                e2e = finished - arrival
+            # V1 path: RequestStateStats
+            ftl = getattr(m, "first_token_latency", None)
+            first_ts = getattr(m, "first_token_ts", None)
+            last_ts = getattr(m, "last_token_ts", None)
+            if ftl is not None:
+                ttft = ftl
+                if first_ts is not None and last_ts is not None:
+                    e2e = ttft + (last_ts - first_ts)
+            else:
+                # V0 fallback
+                arrival = getattr(m, "arrival_time", None)
+                first_tok = getattr(m, "first_token_time", None)
+                finished = getattr(m, "finished_time", None)
+                if arrival is not None and first_tok is not None:
+                    ttft = first_tok - arrival
+                if arrival is not None and finished is not None:
+                    e2e = finished - arrival
         lats.append(RequestLatency(ttft_s=ttft, e2e_s=e2e, n_output_tokens=n_out))
     return lats
 
