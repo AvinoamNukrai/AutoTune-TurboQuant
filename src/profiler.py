@@ -307,8 +307,8 @@ def _cache_get_kv(cache, layer_idx):
             _cache_api_logged = True
             print(f"  DynamicLayer vars: {list(vars(layer).keys())}", flush=True)
         # Try common attribute names
-        for kn, vn in [("key", "value"), ("key_cache", "value_cache"),
-                       ("k", "v"), ("key_states", "value_states")]:
+        for kn, vn in [("keys", "values"), ("key", "value"),
+                       ("key_cache", "value_cache")]:
             if hasattr(layer, kn):
                 return getattr(layer, kn), getattr(layer, vn)
     return None, None
@@ -322,8 +322,8 @@ def _cache_set_kv(cache, layer_idx, key, value):
         return
     if hasattr(cache, "layers") and isinstance(cache.layers, list):
         layer = cache.layers[layer_idx]
-        for kn, vn in [("key", "value"), ("key_cache", "value_cache"),
-                       ("k", "v"), ("key_states", "value_states")]:
+        for kn, vn in [("keys", "values"), ("key", "value"),
+                       ("key_cache", "value_cache")]:
             if hasattr(layer, kn):
                 setattr(layer, kn, key)
                 setattr(layer, vn, value)
