@@ -318,11 +318,8 @@ def _get_decoder_layers(model):
 # Cache K/V access — transformers DynamicCache API varies across versions
 # --------------------------------------------------------------------------
 
-_cache_api_logged = False
-
 def _cache_get_kv(cache, layer_idx):
     """Read (key, value) tensors for a given layer from DynamicCache."""
-    global _cache_api_logged
     # Pattern A: .key_cache / .value_cache lists (transformers 4.36-4.47)
     if hasattr(cache, "key_cache") and isinstance(getattr(cache, "key_cache"), list):
         kc = cache.key_cache
@@ -331,10 +328,6 @@ def _cache_get_kv(cache, layer_idx):
     # Pattern B: .layers list of DynamicLayer (transformers 4.48+)
     if hasattr(cache, "layers") and isinstance(cache.layers, list):
         layer = cache.layers[layer_idx]
-        if not _cache_api_logged:
-            _cache_api_logged = True
-            print(f"  DynamicLayer vars: {list(vars(layer).keys())}", flush=True)
-        # Try common attribute names
         for kn, vn in [("keys", "values"), ("key", "value"),
                        ("key_cache", "value_cache")]:
             if hasattr(layer, kn):
