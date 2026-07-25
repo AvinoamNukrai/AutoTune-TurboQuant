@@ -502,9 +502,9 @@ def compute_h1a_correlations(
             continue
         rho, pval = spearmanr(fvals, delta_ppls)
         results[fname] = {
-            "rho": round(rho, 4),
-            "p_value": round(pval, 6),
-            "valid": abs(rho) > 0.5 and pval < 0.05,
+            "rho": round(float(rho), 4),
+            "p_value": round(float(pval), 6),
+            "valid": bool(abs(rho) > 0.5 and pval < 0.05),
         }
     return results
 
