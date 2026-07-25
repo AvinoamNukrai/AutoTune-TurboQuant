@@ -207,8 +207,20 @@ def compute_features(
 
 
 # --------------------------------------------------------------------------
-# K/V capture via HuggingFace hooks
+# K/V capture via DynamicCache (transformers >= 4.36)
 # --------------------------------------------------------------------------
+
+def _load_model_and_tokenizer(model_name: str, device: str):
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name, dtype=torch.float16, device_map=device,
+        trust_remote_code=True,
+    )
+    model.eval()
+    return model, tokenizer
+
 
 def extract_kv_per_layer(
     model_name: str,
@@ -218,63 +230,49 @@ def extract_kv_per_layer(
 ) -> dict[int, dict[str, torch.Tensor]]:
     """Run a calibration forward pass and capture post-RoPE K/V per layer.
 
+    Uses the DynamicCache object returned by the model (modern transformers
+    stores K/V there, not as plain tuples in the attention output).
+
     Returns:
         {layer_idx: {"keys": Tensor, "values": Tensor}} on CPU.
+        keys/values shape: (total_tokens, n_heads, head_dim)
     """
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    model, tokenizer = _load_model_and_tokenizer(model_name, device)
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name, torch_dtype=torch.float16, device_map=device,
-        trust_remote_code=True,
-    )
-    model.eval()
+    all_keys: dict[int, list[torch.Tensor]] = {}
+    all_values: dict[int, list[torch.Tensor]] = {}
 
-    captured: dict[int, dict[str, list[torch.Tensor]]] = {}
-    hooks = []
-
-    def make_hook(layer_idx):
-        def hook_fn(module, args, kwargs, output):
-            # Qwen2/3 and Llama attention modules output
-            # (attn_output, attn_weights, past_key_value)
-            # past_key_value is a tuple (keys, values) after RoPE
-            if isinstance(output, tuple) and len(output) >= 3:
-                past_kv = output[2]
-                if past_kv is not None and isinstance(past_kv, tuple) and len(past_kv) == 2:
-                    k, v = past_kv
-                    if layer_idx not in captured:
-                        captured[layer_idx] = {"keys": [], "values": []}
-                    # k, v shape: (batch, n_heads, seq_len, head_dim)
-                    captured[layer_idx]["keys"].append(k.detach().cpu())
-                    captured[layer_idx]["values"].append(v.detach().cpu())
-        return hook_fn
-
-    # Register hooks on attention modules
-    for layer_idx, layer in enumerate(_get_decoder_layers(model)):
-        attn = _get_attention_module(layer)
-        if attn is not None:
-            h = attn.register_forward_hook(make_hook(layer_idx), with_kwargs=True)
-            hooks.append(h)
-
-    # Forward pass(es)
     with torch.no_grad():
         for text in texts:
             inputs = tokenizer(
                 text, return_tensors="pt", truncation=True,
                 max_length=max_tokens,
             ).to(device)
-            model(**inputs, use_cache=True)
+            outputs = model(**inputs, use_cache=True)
 
-    # Remove hooks
-    for h in hooks:
-        h.remove()
+            past_kv = outputs.past_key_values
+            print(f"  past_kv type: {type(past_kv).__name__}, "
+                  f"has key_cache: {hasattr(past_kv, 'key_cache')}, "
+                  f"dir: {[a for a in dir(past_kv) if not a.startswith('_') and 'cache' in a.lower()]}",
+                  flush=True)
+            if hasattr(past_kv, "key_cache"):
+                n_layers = len(past_kv.key_cache)
+                for layer_idx in range(n_layers):
+                    k = past_kv.key_cache[layer_idx].detach().cpu()
+                    v = past_kv.value_cache[layer_idx].detach().cpu()
+                    all_keys.setdefault(layer_idx, []).append(k)
+                    all_values.setdefault(layer_idx, []).append(v)
+            else:
+                for layer_idx, (k, v) in enumerate(past_kv):
+                    all_keys.setdefault(layer_idx, []).append(k.detach().cpu())
+                    all_values.setdefault(layer_idx, []).append(v.detach().cpu())
 
-    # Concatenate across texts
     result = {}
-    for layer_idx, kv in captured.items():
-        keys = torch.cat(kv["keys"], dim=0)      # (n_texts, n_heads, seq_len, head_dim)
-        values = torch.cat(kv["values"], dim=0)
-        # Reshape: merge batch and seq → (total_tokens, n_heads, head_dim)
+    for layer_idx in sorted(all_keys.keys()):
+        # Each tensor: (batch=1, n_heads, seq_len, head_dim)
+        keys = torch.cat(all_keys[layer_idx], dim=0)
+        values = torch.cat(all_values[layer_idx], dim=0)
+        # Reshape: (n_texts, n_heads, seq_len, head_dim) → (total_tokens, n_heads, head_dim)
         keys = keys.permute(0, 2, 1, 3).reshape(-1, keys.shape[1], keys.shape[3])
         values = values.permute(0, 2, 1, 3).reshape(-1, values.shape[1], values.shape[3])
         result[layer_idx] = {"keys": keys, "values": values}
@@ -293,14 +291,6 @@ def _get_decoder_layers(model):
     raise ValueError(f"Cannot find decoder layers in {type(model).__name__}")
 
 
-def _get_attention_module(layer):
-    """Get the attention sub-module from a decoder layer."""
-    for name in ("self_attn", "attn", "attention"):
-        if hasattr(layer, name):
-            return getattr(layer, name)
-    return None
-
-
 # --------------------------------------------------------------------------
 # Ground-truth sensitivity (ΔPPL per layer)
 # --------------------------------------------------------------------------
@@ -311,76 +301,38 @@ def measure_layer_sensitivity(
     key_bits: int = 3,
     value_bits: int = 4,
     max_tokens: int = 2048,
+    chunk_size: int = 256,
     device: str = "cuda",
 ) -> dict:
     """Measure per-layer quantization sensitivity via ΔPPL.
 
-    For each layer L:
-      1. Run full model with layer L's K/V quantized (simulated), rest FP16
-      2. Compute PPL
-      3. ΔPPL = PPL_quantized - PPL_baseline
-
-    Returns dict with baseline_ppl, per_layer results, and the sensitivity curve.
+    Uses chunked processing so that tokens in chunk 2+ attend to the
+    quantized cache from previous chunks — a single-pass forward would
+    compute attention from unquantized hidden states and miss the effect.
     """
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name, torch_dtype=torch.float16, device_map=device,
-        trust_remote_code=True,
-    )
-    model.eval()
+    model, tokenizer = _load_model_and_tokenizer(model_name, device)
 
     n_layers = len(_get_decoder_layers(model))
     print(f"Model has {n_layers} layers", flush=True)
 
-    # Tokenize eval texts
     all_input_ids = []
     for text in eval_texts:
         ids = tokenizer.encode(text, truncation=True, max_length=max_tokens)
         if len(ids) > 100:
             all_input_ids.append(torch.tensor(ids, device=device))
 
-    # Baseline PPL (no quantization)
-    print("Computing baseline PPL...", flush=True)
-    baseline_ppl = _compute_hf_ppl(model, all_input_ids)
+    print("Computing baseline PPL (chunked, no quantization)...", flush=True)
+    baseline_ppl = _compute_hf_ppl_chunked(model, all_input_ids, chunk_size)
     print(f"Baseline PPL: {baseline_ppl:.4f}", flush=True)
 
-    # Per-layer sensitivity
     results = []
     for target_layer in range(n_layers):
-        hook_handle = None
-
-        def make_quant_hook(layer_idx):
-            def hook_fn(module, args, kwargs, output):
-                if isinstance(output, tuple) and len(output) >= 3:
-                    past_kv = output[2]
-                    if past_kv is not None and isinstance(past_kv, tuple) and len(past_kv) == 2:
-                        k, v = past_kv
-                        # Quantize this layer's K/V
-                        orig_shape = k.shape
-                        k_flat = k.reshape(-1, k.shape[-1])
-                        v_flat = v.reshape(-1, v.shape[-1])
-                        k_q = simulate_turbo_quant_keys(k_flat, n_bits=key_bits)
-                        v_q = simulate_turbo_quant_values(v_flat, n_bits=value_bits)
-                        k_q = k_q.reshape(orig_shape)
-                        v_q = v_q.reshape(orig_shape)
-                        output = (output[0], output[1], (k_q, v_q)) + output[3:]
-                return output
-            return hook_fn
-
-        layer = _get_decoder_layers(model)[target_layer]
-        attn = _get_attention_module(layer)
-        if attn is not None:
-            hook_handle = attn.register_forward_hook(
-                make_quant_hook(target_layer), with_kwargs=True)
-
         t0 = time.perf_counter()
-        layer_ppl = _compute_hf_ppl(model, all_input_ids)
+        layer_ppl = _compute_hf_ppl_chunked(
+            model, all_input_ids, chunk_size,
+            quant_layer=target_layer, key_bits=key_bits, value_bits=value_bits,
+        )
         elapsed = time.perf_counter() - t0
-
-        if hook_handle is not None:
-            hook_handle.remove()
 
         delta_ppl = layer_ppl - baseline_ppl
         results.append({
@@ -405,18 +357,81 @@ def measure_layer_sensitivity(
     }
 
 
-def _compute_hf_ppl(model, input_ids_list: list[torch.Tensor]) -> float:
-    """Compute perplexity over a list of tokenized texts using HF model."""
+def _compute_hf_ppl_chunked(
+    model,
+    input_ids_list: list[torch.Tensor],
+    chunk_size: int = 256,
+    quant_layer: int | None = None,
+    key_bits: int = 3,
+    value_bits: int = 4,
+) -> float:
+    """Chunked PPL so cache quantization is visible to attention.
+
+    Processes each sequence in chunks of chunk_size tokens with
+    use_cache=True. After each chunk, if quant_layer is set, the new
+    cache entries for that layer are quantized via simulate_turbo_quant.
+    Tokens from chunk 2 onward attend to the quantized cache and are
+    scored; chunk 1 is skipped (it sees no cached data).
+    """
     total_nll = 0.0
     total_tokens = 0
 
     with torch.no_grad():
         for input_ids in input_ids_list:
-            ids = input_ids.unsqueeze(0)
-            outputs = model(ids, labels=ids)
-            seq_len = ids.shape[1] - 1
-            total_nll += outputs.loss.item() * seq_len
-            total_tokens += seq_len
+            seq_len = input_ids.shape[0]
+            past_kv = None
+            cached_len = 0
+
+            for chunk_idx, start in enumerate(range(0, seq_len, chunk_size)):
+                end = min(start + chunk_size, seq_len)
+                chunk = input_ids[start:end].unsqueeze(0)
+
+                fwd_kwargs: dict = {"use_cache": True}
+                if past_kv is not None:
+                    fwd_kwargs["past_key_values"] = past_kv
+
+                outputs = model(chunk, **fwd_kwargs)
+                past_kv = outputs.past_key_values
+
+                if (quant_layer is not None
+                        and hasattr(past_kv, "key_cache")
+                        and quant_layer < len(past_kv.key_cache)):
+                    k = past_kv.key_cache[quant_layer]
+                    v = past_kv.value_cache[quant_layer]
+                    new_len = k.shape[2]
+                    if new_len > cached_len:
+                        new_k = k[:, :, cached_len:, :]
+                        new_v = v[:, :, cached_len:, :]
+                        nk_s, nv_s = new_k.shape, new_v.shape
+                        new_k_q = simulate_turbo_quant_keys(
+                            new_k.reshape(-1, nk_s[-1]), n_bits=key_bits,
+                        ).reshape(nk_s)
+                        new_v_q = simulate_turbo_quant_values(
+                            new_v.reshape(-1, nv_s[-1]), n_bits=value_bits,
+                        ).reshape(nv_s)
+                        if cached_len > 0:
+                            past_kv.key_cache[quant_layer] = torch.cat(
+                                [k[:, :, :cached_len, :], new_k_q], dim=2)
+                            past_kv.value_cache[quant_layer] = torch.cat(
+                                [v[:, :, :cached_len, :], new_v_q], dim=2)
+                        else:
+                            past_kv.key_cache[quant_layer] = new_k_q
+                            past_kv.value_cache[quant_layer] = new_v_q
+                    cached_len = new_len
+
+                if chunk_idx == 0:
+                    continue
+
+                logits = outputs.logits[0]
+                n_score = min(end - start, seq_len - start - 1)
+                if n_score > 0:
+                    pred = logits[:n_score]
+                    targets = input_ids[start + 1:start + 1 + n_score]
+                    log_probs = F.log_softmax(pred, dim=-1)
+                    token_nlls = -log_probs.gather(
+                        1, targets.unsqueeze(1)).squeeze(1)
+                    total_nll += token_nlls.sum().item()
+                    total_tokens += n_score
 
     return math.exp(total_nll / total_tokens) if total_tokens else float('inf')
 
