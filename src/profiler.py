@@ -251,18 +251,53 @@ def extract_kv_per_layer(
             outputs = model(**inputs, use_cache=True)
 
             past_kv = outputs.past_key_values
-            n_layers = len(past_kv)
             if not all_keys:
-                print(f"  Cache: {type(past_kv).__name__}, {n_layers} layers, "
-                      f"attrs: {[a for a in dir(past_kv) if not a.startswith('__')]}, "
-                      f"item[0] type: {type(past_kv[0]).__name__ if n_layers else '?'}, "
-                      f"item[0] len: {len(past_kv[0]) if n_layers else '?'}",
-                      flush=True)
-            for layer_idx in range(n_layers):
-                item = past_kv[layer_idx]
-                k, v = item[0], item[1]
-                all_keys.setdefault(layer_idx, []).append(k.detach().cpu())
-                all_values.setdefault(layer_idx, []).append(v.detach().cpu())
+                attrs = [a for a in dir(past_kv) if not a.startswith('__')]
+                inst_vars = list(vars(past_kv).keys()) if hasattr(past_kv, '__dict__') else []
+                print(f"  Cache type: {type(past_kv).__name__}", flush=True)
+                print(f"  Public attrs: {attrs}", flush=True)
+                print(f"  Instance vars: {inst_vars}", flush=True)
+                for iv in inst_vars:
+                    val = getattr(past_kv, iv)
+                    if isinstance(val, (list, tuple)) and len(val) > 0:
+                        print(f"    {iv}: list[{len(val)}] of {type(val[0]).__name__}", flush=True)
+                    elif isinstance(val, torch.Tensor):
+                        print(f"    {iv}: Tensor {val.shape}", flush=True)
+                    else:
+                        print(f"    {iv}: {type(val).__name__} = {val}", flush=True)
+                # Also try iterating
+                try:
+                    first_item = next(iter(past_kv))
+                    print(f"  iter yields: type={type(first_item).__name__}, "
+                          f"len={len(first_item) if hasattr(first_item, '__len__') else 'N/A'}",
+                          flush=True)
+                except Exception as e:
+                    print(f"  iter failed: {e}", flush=True)
+            # Try all known access patterns
+            captured = False
+            # Pattern 1: key_cache / value_cache attributes
+            if hasattr(past_kv, 'key_cache') and isinstance(past_kv.key_cache, list):
+                for layer_idx in range(len(past_kv.key_cache)):
+                    all_keys.setdefault(layer_idx, []).append(past_kv.key_cache[layer_idx].detach().cpu())
+                    all_values.setdefault(layer_idx, []).append(past_kv.value_cache[layer_idx].detach().cpu())
+                captured = True
+            # Pattern 2: private _key_cache / _value_cache
+            if not captured and hasattr(past_kv, '_key_cache'):
+                kc = past_kv._key_cache
+                vc = past_kv._value_cache
+                for layer_idx in range(len(kc)):
+                    all_keys.setdefault(layer_idx, []).append(kc[layer_idx].detach().cpu())
+                    all_values.setdefault(layer_idx, []).append(vc[layer_idx].detach().cpu())
+                captured = True
+            # Pattern 3: iterate and unpack first 2 elements
+            if not captured:
+                for layer_idx, item in enumerate(past_kv):
+                    if isinstance(item, (tuple, list)):
+                        all_keys.setdefault(layer_idx, []).append(item[0].detach().cpu())
+                        all_values.setdefault(layer_idx, []).append(item[1].detach().cpu())
+                    else:
+                        print(f"  Unexpected item type at layer {layer_idx}: {type(item).__name__}", flush=True)
+                        break
 
     result = {}
     for layer_idx in sorted(all_keys.keys()):
