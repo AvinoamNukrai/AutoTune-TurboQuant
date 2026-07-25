@@ -58,6 +58,42 @@ how we know, and why it matters for the report.
 13. **The n=2 protection floor reproduces identically on the 4090**
     (empty skip list → `[0,1,34,35]`) — finding #5 generalizes across GPUs.
 
+## Harness validation — baseline vs. 3bit_nc, RTX 4090, Qwen3-4B (2026-07-24)
+
+Source: Phase 2 harness (`src/harness.py`), two cells — `auto` (FP16 baseline)
+vs. `turboquant_3bit_nc`, both rep 0 on RTX 4090.
+
+14. **TTFT paradox: 3-bit quantization is 8× faster for chat TTFT** (78 ms vs.
+    636 ms baseline). Compressed KV means more tokens fit per chunked-prefill
+    batch → less queuing → faster time-to-first-token under concurrent
+    scheduling. This is a workload-dependent trade-off: TTFT improves while
+    per-token decode slows down. → Core motivation for workload-aware tuning.
+15. **TPOT is 19% slower with 3-bit** (13.6 ms vs. 11.5 ms baseline). Each
+    generated token pays quantization/dequantization overhead. Chat workloads
+    (decode-heavy) are hurt; RAG workloads (prefill-heavy, short output) are
+    less affected.
+16. **PPL degrades 3.4% under 3bit_nc** (10.70 vs. 10.35 baseline). Exceeds
+    the SPEC's 0.5% chat tolerance but within the 2% batch threshold. →
+    Confirms that aggressive quantization is acceptable for some workloads but
+    not others — the utility function per-profile design is necessary.
+17. **Peak VRAM is identical between configs** (21.64 GB 3-bit vs. 21.55 GB
+    baseline). vLLM pre-allocates a fixed KV-cache pool based on
+    `gpu_memory_utilization` (0.85 × 24 GB). Quantization does not reduce
+    *peak memory used* — it increases *capacity* (more tokens fit in the same
+    pool). **Peak VRAM is the wrong metric for measuring compression benefit**;
+    the correct metric is the number of KV-cache blocks allocated or max
+    concurrent sequences. → Must add block-count extraction to harness before
+    Experiment 1.
+18. **Needle accuracy is 1.0 (20/20) under 3bit_nc** — the model retrieves the
+    correct embedded code from 4K–8K token contexts even at aggressive
+    quantization. Combined with finding #16: 3-bit hurts PPL (global quality)
+    but not simple retrieval (local attention still works).
+19. **Per-cell wall time is ~70–100 s on RTX 4090** (67 s for 3bit_nc, 99 s for
+    auto). FP16 baseline is slower due to longer engine init (59 s vs. 27 s) —
+    larger per-token KV means more CUDA graph compilations. Budget for Exp 1
+    (28 cells × 2 reps × ~85 s) ≈ 1.3 GPU-hours — well within the 8–12 h
+    allocation.
+
 ## Methodology / infrastructure lessons
 
 9. **vLLM v1 is multi-process**: `torch.cuda.max_memory_allocated()` in the
@@ -66,3 +102,13 @@ how we know, and why it matters for the report.
 10. **Reproducibility trap**: `vllm==0.20.2` ships sdist-only → pip silently
     attempts an hours-long CUDA source build. Pin `0.21.0` (prebuilt wheel)
     and install with `--only-binary :all:`.
+20. **vLLM V1 offline `LLM.generate()` requires `disable_log_stats=False`** to
+    populate `RequestOutput.metrics`. With `True` (which we initially set to
+    reduce noise), all per-request latencies are `None`. The V1 metrics object
+    is `RequestStateStats`, not the V0 `RequestMetrics` — field names differ
+    (`first_token_latency` vs. `first_token_time`; monotonic timestamps vs.
+    wall-clock). Source: Phase 2 harness debugging.
+21. **HuggingFace `datasets` namespace change**: `load_dataset("wikitext", ...)`
+    fails on recent `huggingface_hub` versions — must use
+    `"Salesforce/wikitext"`. Silent breakage if not caught. Source: harness
+    PPL computation failure on cluster.
