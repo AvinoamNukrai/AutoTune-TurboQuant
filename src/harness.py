@@ -105,25 +105,34 @@ def run_cell_inprocess(cfg: CellConfig) -> dict:
             trace_file = (Path(DEFAULT_TRACE_DIR)
                           / f"{profile}_{cfg.trace_tag}_seed{cfg.trace_seed}.json")
             trace = load_trace(trace_file)
-            prompts = [r["prompt"] for r in trace["requests"]]
-            sps = [SamplingParams(temperature=0.0, max_tokens=r["max_tokens"])
-                   for r in trace["requests"]]
-            t0 = time.perf_counter()
-            outputs = llm.generate(prompts, sps)
-            wall = time.perf_counter() - t0
 
-            lats = extract_latencies(outputs)
+            # Generate per-request to get individual timings.
+            # vLLM's offline LLM.generate() does not populate RequestOutput.metrics,
+            # so we time each call ourselves.
+            lats = []
+            outputs_all = []
+            t_wall_start = time.perf_counter()
+            for req in trace["requests"]:
+                sp = SamplingParams(temperature=0.0, max_tokens=req["max_tokens"])
+                t0 = time.perf_counter()
+                out = llm.generate([req["prompt"]], [sp])
+                e2e = time.perf_counter() - t0
+                outputs_all.append(out[0])
+                n_out = sum(len(c.token_ids) for c in out[0].outputs)
+                lats.append(RequestLatency(
+                    ttft_s=None, e2e_s=e2e, n_output_tokens=n_out))
+            wall = time.perf_counter() - t_wall_start
+
             summary = summarize_latencies(lats)
             summary["wall_s"] = round(wall, 2)
             summary["throughput_tok_s"] = round(
                 summary["total_output_tokens"] / wall, 1)
-            # RAG retrieval accuracy for free (needle codes in the prompt)
             if profile == "rag":
                 hits = sum(
-                    1 for req, out in zip(trace["requests"], outputs)
+                    1 for req, out in zip(trace["requests"], outputs_all)
                     if _extract_code(req["prompt"]) in out.outputs[0].text
                 )
-                summary["needle_accuracy"] = hits / len(outputs)
+                summary["needle_accuracy"] = hits / len(outputs_all)
             result["profiles"][profile] = summary
 
         # --- Perplexity (KV-cache-sensitive; see metrics.py docstring) ---
