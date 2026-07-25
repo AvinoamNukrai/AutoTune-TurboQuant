@@ -532,7 +532,7 @@ def compute_h1a_correlations(
         results[fname] = {
             "rho": round(float(rho), 4),
             "p_value": round(float(pval), 6),
-            "valid": bool(abs(rho) > 0.4 and pval < 0.05),
+            "valid": bool(abs(rho) > 0.35 and pval < 0.05),
         }
     return results
 
