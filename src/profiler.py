@@ -251,53 +251,16 @@ def extract_kv_per_layer(
             outputs = model(**inputs, use_cache=True)
 
             past_kv = outputs.past_key_values
-            if not all_keys:
-                attrs = [a for a in dir(past_kv) if not a.startswith('__')]
-                inst_vars = list(vars(past_kv).keys()) if hasattr(past_kv, '__dict__') else []
-                print(f"  Cache type: {type(past_kv).__name__}", flush=True)
-                print(f"  Public attrs: {attrs}", flush=True)
-                print(f"  Instance vars: {inst_vars}", flush=True)
-                for iv in inst_vars:
-                    val = getattr(past_kv, iv)
-                    if isinstance(val, (list, tuple)) and len(val) > 0:
-                        print(f"    {iv}: list[{len(val)}] of {type(val[0]).__name__}", flush=True)
-                    elif isinstance(val, torch.Tensor):
-                        print(f"    {iv}: Tensor {val.shape}", flush=True)
-                    else:
-                        print(f"    {iv}: {type(val).__name__} = {val}", flush=True)
-                # Also try iterating
-                try:
-                    first_item = next(iter(past_kv))
-                    print(f"  iter yields: type={type(first_item).__name__}, "
-                          f"len={len(first_item) if hasattr(first_item, '__len__') else 'N/A'}",
-                          flush=True)
-                except Exception as e:
-                    print(f"  iter failed: {e}", flush=True)
-            # Try all known access patterns
-            captured = False
-            # Pattern 1: key_cache / value_cache attributes
-            if hasattr(past_kv, 'key_cache') and isinstance(past_kv.key_cache, list):
-                for layer_idx in range(len(past_kv.key_cache)):
-                    all_keys.setdefault(layer_idx, []).append(past_kv.key_cache[layer_idx].detach().cpu())
-                    all_values.setdefault(layer_idx, []).append(past_kv.value_cache[layer_idx].detach().cpu())
-                captured = True
-            # Pattern 2: private _key_cache / _value_cache
-            if not captured and hasattr(past_kv, '_key_cache'):
-                kc = past_kv._key_cache
-                vc = past_kv._value_cache
-                for layer_idx in range(len(kc)):
-                    all_keys.setdefault(layer_idx, []).append(kc[layer_idx].detach().cpu())
-                    all_values.setdefault(layer_idx, []).append(vc[layer_idx].detach().cpu())
-                captured = True
-            # Pattern 3: iterate and unpack first 2 elements
-            if not captured:
-                for layer_idx, item in enumerate(past_kv):
-                    if isinstance(item, (tuple, list)):
-                        all_keys.setdefault(layer_idx, []).append(item[0].detach().cpu())
-                        all_values.setdefault(layer_idx, []).append(item[1].detach().cpu())
-                    else:
-                        print(f"  Unexpected item type at layer {layer_idx}: {type(item).__name__}", flush=True)
-                        break
+            n_layers = len(past_kv)
+            for layer_idx in range(n_layers):
+                k, v = _cache_get_kv(past_kv, layer_idx)
+                if k is not None:
+                    all_keys.setdefault(layer_idx, []).append(k.detach().cpu())
+                    all_values.setdefault(layer_idx, []).append(v.detach().cpu())
+                else:
+                    item = list(past_kv)[layer_idx]
+                    all_keys.setdefault(layer_idx, []).append(item[0].detach().cpu())
+                    all_values.setdefault(layer_idx, []).append(item[1].detach().cpu())
 
     result = {}
     for layer_idx in sorted(all_keys.keys()):
@@ -321,6 +284,51 @@ def _get_decoder_layers(model):
     if hasattr(model, "transformer") and hasattr(model.transformer, "h"):
         return model.transformer.h
     raise ValueError(f"Cannot find decoder layers in {type(model).__name__}")
+
+
+# --------------------------------------------------------------------------
+# Cache K/V access — transformers DynamicCache API varies across versions
+# --------------------------------------------------------------------------
+
+_cache_api_logged = False
+
+def _cache_get_kv(cache, layer_idx):
+    """Read (key, value) tensors for a given layer from DynamicCache."""
+    global _cache_api_logged
+    # Pattern A: .key_cache / .value_cache lists (transformers 4.36-4.47)
+    if hasattr(cache, "key_cache") and isinstance(getattr(cache, "key_cache"), list):
+        kc = cache.key_cache
+        if layer_idx < len(kc):
+            return kc[layer_idx], cache.value_cache[layer_idx]
+    # Pattern B: .layers list of DynamicLayer (transformers 4.48+)
+    if hasattr(cache, "layers") and isinstance(cache.layers, list):
+        layer = cache.layers[layer_idx]
+        if not _cache_api_logged:
+            _cache_api_logged = True
+            print(f"  DynamicLayer vars: {list(vars(layer).keys())}", flush=True)
+        # Try common attribute names
+        for kn, vn in [("key", "value"), ("key_cache", "value_cache"),
+                       ("k", "v"), ("key_states", "value_states")]:
+            if hasattr(layer, kn):
+                return getattr(layer, kn), getattr(layer, vn)
+    return None, None
+
+
+def _cache_set_kv(cache, layer_idx, key, value):
+    """Write (key, value) tensors for a given layer into DynamicCache."""
+    if hasattr(cache, "key_cache") and isinstance(getattr(cache, "key_cache"), list):
+        cache.key_cache[layer_idx] = key
+        cache.value_cache[layer_idx] = value
+        return
+    if hasattr(cache, "layers") and isinstance(cache.layers, list):
+        layer = cache.layers[layer_idx]
+        for kn, vn in [("key", "value"), ("key_cache", "value_cache"),
+                       ("k", "v"), ("key_states", "value_states")]:
+            if hasattr(layer, kn):
+                setattr(layer, kn, key)
+                setattr(layer, vn, value)
+                return
+    raise RuntimeError(f"Cannot write to cache: {type(cache).__name__}")
 
 
 # --------------------------------------------------------------------------
@@ -425,31 +433,29 @@ def _compute_hf_ppl_chunked(
                 outputs = model(chunk, **fwd_kwargs)
                 past_kv = outputs.past_key_values
 
-                if (quant_layer is not None
-                        and hasattr(past_kv, "key_cache")
-                        and quant_layer < len(past_kv.key_cache)):
-                    k = past_kv.key_cache[quant_layer]
-                    v = past_kv.value_cache[quant_layer]
-                    new_len = k.shape[2]
-                    if new_len > cached_len:
-                        new_k = k[:, :, cached_len:, :]
-                        new_v = v[:, :, cached_len:, :]
-                        nk_s, nv_s = new_k.shape, new_v.shape
-                        new_k_q = simulate_turbo_quant_keys(
-                            new_k.reshape(-1, nk_s[-1]), n_bits=key_bits,
-                        ).reshape(nk_s)
-                        new_v_q = simulate_turbo_quant_values(
-                            new_v.reshape(-1, nv_s[-1]), n_bits=value_bits,
-                        ).reshape(nv_s)
-                        if cached_len > 0:
-                            past_kv.key_cache[quant_layer] = torch.cat(
-                                [k[:, :, :cached_len, :], new_k_q], dim=2)
-                            past_kv.value_cache[quant_layer] = torch.cat(
-                                [v[:, :, :cached_len, :], new_v_q], dim=2)
-                        else:
-                            past_kv.key_cache[quant_layer] = new_k_q
-                            past_kv.value_cache[quant_layer] = new_v_q
-                    cached_len = new_len
+                if quant_layer is not None:
+                    k, v = _cache_get_kv(past_kv, quant_layer)
+                    if k is not None:
+                        new_len = k.shape[2]
+                        if new_len > cached_len:
+                            new_k = k[:, :, cached_len:, :]
+                            new_v = v[:, :, cached_len:, :]
+                            nk_s, nv_s = new_k.shape, new_v.shape
+                            new_k_q = simulate_turbo_quant_keys(
+                                new_k.reshape(-1, nk_s[-1]), n_bits=key_bits,
+                            ).reshape(nk_s)
+                            new_v_q = simulate_turbo_quant_values(
+                                new_v.reshape(-1, nv_s[-1]), n_bits=value_bits,
+                            ).reshape(nv_s)
+                            if cached_len > 0:
+                                full_k = torch.cat(
+                                    [k[:, :, :cached_len, :], new_k_q], dim=2)
+                                full_v = torch.cat(
+                                    [v[:, :, :cached_len, :], new_v_q], dim=2)
+                            else:
+                                full_k, full_v = new_k_q, new_v_q
+                            _cache_set_kv(past_kv, quant_layer, full_k, full_v)
+                        cached_len = new_len
 
                 if chunk_idx == 0:
                     continue
