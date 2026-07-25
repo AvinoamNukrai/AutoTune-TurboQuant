@@ -39,7 +39,7 @@ class CellConfig:
 
     model: str = "Qwen/Qwen3-4B"
     kv_cache_dtype: str = "auto"
-    skip_layers: tuple[str, ...] = ()      # user-supplied additions (floor is implicit)
+    skip_layers: tuple[int | str, ...] = ()  # user-supplied additions (floor is implicit)
     max_model_len: int = 10240
     gpu_memory_utilization: float = 0.85
     chunk_size: int = 512                  # max_num_batched_tokens (chunked prefill)
@@ -89,7 +89,7 @@ def run_cell_inprocess(cfg: CellConfig) -> dict:
             disable_log_stats=False,
         )
         if cfg.skip_layers:
-            engine_kwargs["kv_cache_dtype_skip_layers"] = list(cfg.skip_layers)
+            engine_kwargs["kv_cache_dtype_skip_layers"] = [str(x) for x in cfg.skip_layers]
         llm = LLM(**engine_kwargs)
         result["engine_load_s"] = round(time.perf_counter() - t0, 2)
 
