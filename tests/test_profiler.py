@@ -29,7 +29,7 @@ def test_hadamard_bad_dim():
 def test_centroids_sorted_and_symmetric():
     for bits in [2, 3, 4]:
         c = load_centroids(bits)
-        assert len(c) >= 4, f"too few centroids for {bits}-bit"
+        assert len(c) == 2**bits, f"expected {2**bits} centroids for {bits}-bit, got {len(c)}"
         assert (c == c.sort().values).all(), "centroids must be sorted"
         assert torch.allclose(c, -c.flip(0), atol=1e-4), "centroids must be symmetric"
 

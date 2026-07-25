@@ -44,27 +44,55 @@ import torch.nn.functional as F
 # TurboQuant math (ported from vLLM's centroids.py)
 # --------------------------------------------------------------------------
 
-def load_centroids(n_bits: int = 3) -> torch.Tensor:
-    """Load Lloyd-Max centroids for N(0,1) that vLLM ships.
+def _solve_lloyd_max_normal(n_bits: int, n_iter: int = 200) -> torch.Tensor:
+    """Compute Lloyd-Max optimal centroids for N(0,1).
 
-    vLLM precomputes these for 2/3/4-bit and stores them as constants.
-    We reproduce the 3-bit set inline (8 centroids for the standard
-    normal distribution, matching vLLM's `_CENTROIDS_3BIT`).
+    Iterative algorithm: alternate between updating decision boundaries
+    (midpoints of adjacent centroids) and updating centroids (conditional
+    expectation of N(0,1) within each bin).
     """
-    if n_bits == 3:
-        return torch.tensor([
-            -1.5104, -0.8272, -0.4542, -0.1340,
-             0.1340,  0.4542,  0.8272,  1.5104,
-        ])
-    if n_bits == 4:
-        return torch.tensor([
-            -1.8346, -1.3062, -0.9413, -0.6413,
-            -0.3706, -0.1140,  0.1140,  0.3706,
-             0.6413,  0.9413,  1.3062,  1.8346,
-        ])
-    if n_bits == 2:
-        return torch.tensor([-1.5104, -0.4528, 0.4528, 1.5104])
-    raise ValueError(f"unsupported n_bits={n_bits}")
+    n_levels = 2 ** n_bits
+    # Initialize with uniform quantiles of N(0,1)
+    from scipy.stats import norm as _norm
+    quantiles = torch.tensor(
+        [_norm.ppf((i + 0.5) / n_levels) for i in range(n_levels)],
+        dtype=torch.float64,
+    )
+    centroids = quantiles.clone()
+
+    for _ in range(n_iter):
+        # Decision boundaries = midpoints between adjacent centroids
+        bounds = torch.empty(n_levels + 1, dtype=torch.float64)
+        bounds[0] = -8.0
+        bounds[-1] = 8.0
+        for i in range(1, n_levels):
+            bounds[i] = 0.5 * (centroids[i - 1] + centroids[i])
+
+        # Update centroids = E[X | bounds[i] < X < bounds[i+1]]
+        for i in range(n_levels):
+            lo, hi = bounds[i].item(), bounds[i + 1].item()
+            # E[X | lo < X < hi] for X ~ N(0,1):
+            #   = (φ(lo) - φ(hi)) / (Φ(hi) - Φ(lo))
+            pdf_lo = _norm.pdf(lo)
+            pdf_hi = _norm.pdf(hi)
+            cdf_lo = _norm.cdf(lo)
+            cdf_hi = _norm.cdf(hi)
+            denom = cdf_hi - cdf_lo
+            if denom > 1e-15:
+                centroids[i] = (pdf_lo - pdf_hi) / denom
+            # else keep previous value
+
+    return centroids.float()
+
+
+_CENTROID_CACHE: dict[int, torch.Tensor] = {}
+
+
+def load_centroids(n_bits: int = 3) -> torch.Tensor:
+    """Lloyd-Max optimal centroids for N(0,1), computed once and cached."""
+    if n_bits not in _CENTROID_CACHE:
+        _CENTROID_CACHE[n_bits] = _solve_lloyd_max_normal(n_bits)
+    return _CENTROID_CACHE[n_bits]
 
 
 def hadamard_matrix(d: int) -> torch.Tensor:
