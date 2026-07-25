@@ -251,21 +251,18 @@ def extract_kv_per_layer(
             outputs = model(**inputs, use_cache=True)
 
             past_kv = outputs.past_key_values
-            print(f"  past_kv type: {type(past_kv).__name__}, "
-                  f"has key_cache: {hasattr(past_kv, 'key_cache')}, "
-                  f"dir: {[a for a in dir(past_kv) if not a.startswith('_') and 'cache' in a.lower()]}",
-                  flush=True)
-            if hasattr(past_kv, "key_cache"):
-                n_layers = len(past_kv.key_cache)
-                for layer_idx in range(n_layers):
-                    k = past_kv.key_cache[layer_idx].detach().cpu()
-                    v = past_kv.value_cache[layer_idx].detach().cpu()
-                    all_keys.setdefault(layer_idx, []).append(k)
-                    all_values.setdefault(layer_idx, []).append(v)
-            else:
-                for layer_idx, (k, v) in enumerate(past_kv):
-                    all_keys.setdefault(layer_idx, []).append(k.detach().cpu())
-                    all_values.setdefault(layer_idx, []).append(v.detach().cpu())
+            n_layers = len(past_kv)
+            if not all_keys:
+                print(f"  Cache: {type(past_kv).__name__}, {n_layers} layers, "
+                      f"attrs: {[a for a in dir(past_kv) if not a.startswith('__')]}, "
+                      f"item[0] type: {type(past_kv[0]).__name__ if n_layers else '?'}, "
+                      f"item[0] len: {len(past_kv[0]) if n_layers else '?'}",
+                      flush=True)
+            for layer_idx in range(n_layers):
+                item = past_kv[layer_idx]
+                k, v = item[0], item[1]
+                all_keys.setdefault(layer_idx, []).append(k.detach().cpu())
+                all_values.setdefault(layer_idx, []).append(v.detach().cpu())
 
     result = {}
     for layer_idx in sorted(all_keys.keys()):
