@@ -45,16 +45,17 @@ class VramSampler:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._nvml = None
+        self._handle = None
 
     def _read_used_gb(self) -> float:
-        handle = self._nvml.nvmlDeviceGetHandleByIndex(self.device_index)
-        info = self._nvml.nvmlDeviceGetMemoryInfo(handle)
+        info = self._nvml.nvmlDeviceGetMemoryInfo(self._handle)
         return info.used / 2**30
 
     def __enter__(self) -> "VramSampler":
         import pynvml  # noqa: PLC0415 — ships inside the nvidia-ml-py dep of vllm
         self._nvml = pynvml
         pynvml.nvmlInit()
+        self._handle = pynvml.nvmlDeviceGetHandleByIndex(self.device_index)
         self.baseline_gb = self._read_used_gb()
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
@@ -171,7 +172,7 @@ def load_wikitext_docs(cfg: PPLConfig, tokenizer) -> list[str]:
     """Concatenate WikiText-2 test split into n_docs documents of ~doc_tokens."""
     from datasets import load_dataset  # noqa: PLC0415
 
-    ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+    ds = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test")
     text = "\n".join(row["text"] for row in ds if row["text"].strip())
     ids = tokenizer.encode(text)
     docs = []

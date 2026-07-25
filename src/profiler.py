@@ -1,0 +1,659 @@
+"""Layer-sensitivity profiler for Experiment 0 (SPEC §6, Exp 0).
+
+Runs on HuggingFace Transformers (not vLLM) to get hook access to
+per-layer K/V tensors. Two passes:
+
+1. **Feature extraction** — one calibration forward pass with hooks
+   capturing post-RoPE keys and pre-store values at every layer.
+   Computes the 5 candidate features (§3.4) per layer in streaming
+   fashion (no full-tensor retention).
+
+2. **Ground-truth sensitivity** — for each layer L, simulate TurboQuant
+   quantization on that layer's K/V only (all others FP16), measure
+   ΔPPL. This gives the true per-layer sensitivity curve.
+
+H1a test: Spearman correlation between each feature and the ground-truth
+curve. Features that pass (|ρ| > threshold, stable across calibration
+domains) feed the profiler ranking used by the tuner.
+
+CLI:
+    # Feature extraction only (fast, ~5 min):
+    python -m src.profiler --mode features --model Qwen/Qwen3-4B
+
+    # Ground-truth sensitivity curve (~2-3 GPU-h):
+    python -m src.profiler --mode sensitivity --model Qwen/Qwen3-4B
+
+    # Full Experiment 0 (features + sensitivity + correlation):
+    python -m src.profiler --mode full --model Qwen/Qwen3-4B
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import torch
+import torch.nn.functional as F
+
+
+# --------------------------------------------------------------------------
+# TurboQuant math (ported from vLLM's centroids.py)
+# --------------------------------------------------------------------------
+
+def load_centroids(n_bits: int = 3) -> torch.Tensor:
+    """Load Lloyd-Max centroids for N(0,1) that vLLM ships.
+
+    vLLM precomputes these for 2/3/4-bit and stores them as constants.
+    We reproduce the 3-bit set inline (8 centroids for the standard
+    normal distribution, matching vLLM's `_CENTROIDS_3BIT`).
+    """
+    if n_bits == 3:
+        return torch.tensor([
+            -1.5104, -0.8272, -0.4542, -0.1340,
+             0.1340,  0.4542,  0.8272,  1.5104,
+        ])
+    if n_bits == 4:
+        return torch.tensor([
+            -1.8346, -1.3062, -0.9413, -0.6413,
+            -0.3706, -0.1140,  0.1140,  0.3706,
+             0.6413,  0.9413,  1.3062,  1.8346,
+        ])
+    if n_bits == 2:
+        return torch.tensor([-1.5104, -0.4528, 0.4528, 1.5104])
+    raise ValueError(f"unsupported n_bits={n_bits}")
+
+
+def hadamard_matrix(d: int) -> torch.Tensor:
+    """Construct a normalized Walsh-Hadamard matrix of size d (power of 2)."""
+    assert d > 0 and (d & (d - 1)) == 0, f"d must be power of 2, got {d}"
+    H = torch.tensor([[1.0]])
+    while H.shape[0] < d:
+        H = torch.cat([
+            torch.cat([H, H], dim=1),
+            torch.cat([H, -H], dim=1),
+        ], dim=0)
+    return H / math.sqrt(d)
+
+
+def simulate_turbo_quant_keys(keys: torch.Tensor, n_bits: int = 3) -> torch.Tensor:
+    """Simulate TurboQuant key quantization: Hadamard rotation + Lloyd-Max.
+
+    Args:
+        keys: (n_tokens, head_dim) post-RoPE key tensor, float.
+        n_bits: quantization bit-width for keys.
+
+    Returns:
+        Dequantized keys, same shape.
+    """
+    head_dim = keys.shape[-1]
+    centroids = load_centroids(n_bits).to(keys.device, keys.dtype)
+
+    H = hadamard_matrix(head_dim).to(keys.device, keys.dtype)
+    rotated = keys @ H.T
+
+    std = rotated.std(dim=-1, keepdim=True).clamp(min=1e-8)
+    normalized = rotated / std
+
+    # Lloyd-Max quantization: find nearest centroid
+    dists = (normalized.unsqueeze(-1) - centroids.unsqueeze(0).unsqueeze(0)) ** 2
+    indices = dists.argmin(dim=-1)
+    quantized_normalized = centroids[indices]
+
+    dequantized = quantized_normalized * std
+    restored = dequantized @ H
+
+    return restored
+
+
+def simulate_turbo_quant_values(values: torch.Tensor, n_bits: int = 4) -> torch.Tensor:
+    """Simulate TurboQuant value quantization: per-vector uniform.
+
+    Args:
+        values: (n_tokens, head_dim) value tensor, float.
+        n_bits: quantization bit-width for values.
+
+    Returns:
+        Dequantized values, same shape.
+    """
+    n_levels = 2 ** n_bits
+    vmin = values.min(dim=-1, keepdim=True).values
+    vmax = values.max(dim=-1, keepdim=True).values
+    scale = (vmax - vmin).clamp(min=1e-8) / (n_levels - 1)
+
+    quantized = torch.round((values - vmin) / scale).clamp(0, n_levels - 1)
+    dequantized = quantized * scale + vmin
+    return dequantized
+
+
+# --------------------------------------------------------------------------
+# Feature computation (§3.4 candidate features)
+# --------------------------------------------------------------------------
+
+@dataclass
+class LayerFeatures:
+    """Per-layer statistics computed from one calibration pass."""
+    layer_idx: int
+    key_outlier_frac: float = 0.0
+    post_wht_excess_kurtosis: float = 0.0
+    key_norm_cv: float = 0.0
+    value_dynamic_range: float = 0.0
+    simulated_quant_error: float = 0.0
+
+
+def compute_features(
+    keys: torch.Tensor,
+    values: torch.Tensor,
+    layer_idx: int,
+    outlier_threshold: float = 3.0,
+    key_bits: int = 3,
+    value_bits: int = 4,
+) -> LayerFeatures:
+    """Compute the 5 candidate features for one layer's K/V.
+
+    Args:
+        keys: (n_tokens, n_heads, head_dim) post-RoPE key tensor.
+        values: (n_tokens, n_heads, head_dim) value tensor.
+        layer_idx: layer index.
+    """
+    feats = LayerFeatures(layer_idx=layer_idx)
+
+    # Flatten heads for channel-level statistics
+    # keys shape: (n_tokens, n_heads, head_dim) → (n_tokens * n_heads, head_dim)
+    k_flat = keys.reshape(-1, keys.shape[-1]).float()
+    v_flat = values.reshape(-1, values.shape[-1]).float()
+
+    # --- Feature 1: key outlier-channel fraction ---
+    # Fraction of channels where any token exceeds `outlier_threshold` stddevs
+    channel_std = k_flat.std(dim=0)
+    channel_mean = k_flat.mean(dim=0)
+    max_abs_z = ((k_flat - channel_mean) / channel_std.clamp(min=1e-8)).abs().max(dim=0).values
+    feats.key_outlier_frac = (max_abs_z > outlier_threshold).float().mean().item()
+
+    # --- Feature 2: post-WHT excess kurtosis ---
+    head_dim = keys.shape[-1]
+    if head_dim > 0 and (head_dim & (head_dim - 1)) == 0:
+        H = hadamard_matrix(head_dim).to(k_flat.device, k_flat.dtype)
+        rotated = k_flat @ H.T
+        mean_r = rotated.mean(dim=0)
+        var_r = rotated.var(dim=0).clamp(min=1e-8)
+        m4 = ((rotated - mean_r) ** 4).mean(dim=0)
+        kurtosis = (m4 / var_r**2) - 3.0  # excess kurtosis
+        feats.post_wht_excess_kurtosis = kurtosis.mean().item()
+    else:
+        feats.post_wht_excess_kurtosis = float('nan')
+
+    # --- Feature 3: key-norm coefficient of variation ---
+    key_norms = k_flat.norm(dim=-1)
+    norm_mean = key_norms.mean()
+    norm_std = key_norms.std()
+    feats.key_norm_cv = (norm_std / norm_mean.clamp(min=1e-8)).item()
+
+    # --- Feature 4: per-vector value dynamic range ---
+    v_ranges = v_flat.max(dim=-1).values - v_flat.min(dim=-1).values
+    feats.value_dynamic_range = v_ranges.mean().item()
+
+    # --- Feature 5: direct simulated quantization error ---
+    k_quant = simulate_turbo_quant_keys(k_flat, n_bits=key_bits)
+    v_quant = simulate_turbo_quant_values(v_flat, n_bits=value_bits)
+    k_mse = F.mse_loss(k_quant, k_flat).item()
+    v_mse = F.mse_loss(v_quant, v_flat).item()
+    feats.simulated_quant_error = k_mse + v_mse
+
+    return feats
+
+
+# --------------------------------------------------------------------------
+# K/V capture via HuggingFace hooks
+# --------------------------------------------------------------------------
+
+def extract_kv_per_layer(
+    model_name: str,
+    texts: list[str],
+    max_tokens: int = 2048,
+    device: str = "cuda",
+) -> dict[int, dict[str, torch.Tensor]]:
+    """Run a calibration forward pass and capture post-RoPE K/V per layer.
+
+    Returns:
+        {layer_idx: {"keys": Tensor, "values": Tensor}} on CPU.
+    """
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name, torch_dtype=torch.float16, device_map=device,
+        trust_remote_code=True,
+    )
+    model.eval()
+
+    captured: dict[int, dict[str, list[torch.Tensor]]] = {}
+    hooks = []
+
+    def make_hook(layer_idx):
+        def hook_fn(module, args, kwargs, output):
+            # Qwen2/3 and Llama attention modules output
+            # (attn_output, attn_weights, past_key_value)
+            # past_key_value is a tuple (keys, values) after RoPE
+            if isinstance(output, tuple) and len(output) >= 3:
+                past_kv = output[2]
+                if past_kv is not None and isinstance(past_kv, tuple) and len(past_kv) == 2:
+                    k, v = past_kv
+                    if layer_idx not in captured:
+                        captured[layer_idx] = {"keys": [], "values": []}
+                    # k, v shape: (batch, n_heads, seq_len, head_dim)
+                    captured[layer_idx]["keys"].append(k.detach().cpu())
+                    captured[layer_idx]["values"].append(v.detach().cpu())
+        return hook_fn
+
+    # Register hooks on attention modules
+    for layer_idx, layer in enumerate(_get_decoder_layers(model)):
+        attn = _get_attention_module(layer)
+        if attn is not None:
+            h = attn.register_forward_hook(make_hook(layer_idx), with_kwargs=True)
+            hooks.append(h)
+
+    # Forward pass(es)
+    with torch.no_grad():
+        for text in texts:
+            inputs = tokenizer(
+                text, return_tensors="pt", truncation=True,
+                max_length=max_tokens,
+            ).to(device)
+            model(**inputs, use_cache=True)
+
+    # Remove hooks
+    for h in hooks:
+        h.remove()
+
+    # Concatenate across texts
+    result = {}
+    for layer_idx, kv in captured.items():
+        keys = torch.cat(kv["keys"], dim=0)      # (n_texts, n_heads, seq_len, head_dim)
+        values = torch.cat(kv["values"], dim=0)
+        # Reshape: merge batch and seq → (total_tokens, n_heads, head_dim)
+        keys = keys.permute(0, 2, 1, 3).reshape(-1, keys.shape[1], keys.shape[3])
+        values = values.permute(0, 2, 1, 3).reshape(-1, values.shape[1], values.shape[3])
+        result[layer_idx] = {"keys": keys, "values": values}
+
+    del model
+    torch.cuda.empty_cache()
+    return result
+
+
+def _get_decoder_layers(model):
+    """Get the list of decoder layers from a HF model."""
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        return model.model.layers
+    if hasattr(model, "transformer") and hasattr(model.transformer, "h"):
+        return model.transformer.h
+    raise ValueError(f"Cannot find decoder layers in {type(model).__name__}")
+
+
+def _get_attention_module(layer):
+    """Get the attention sub-module from a decoder layer."""
+    for name in ("self_attn", "attn", "attention"):
+        if hasattr(layer, name):
+            return getattr(layer, name)
+    return None
+
+
+# --------------------------------------------------------------------------
+# Ground-truth sensitivity (ΔPPL per layer)
+# --------------------------------------------------------------------------
+
+def measure_layer_sensitivity(
+    model_name: str,
+    eval_texts: list[str],
+    key_bits: int = 3,
+    value_bits: int = 4,
+    max_tokens: int = 2048,
+    device: str = "cuda",
+) -> dict:
+    """Measure per-layer quantization sensitivity via ΔPPL.
+
+    For each layer L:
+      1. Run full model with layer L's K/V quantized (simulated), rest FP16
+      2. Compute PPL
+      3. ΔPPL = PPL_quantized - PPL_baseline
+
+    Returns dict with baseline_ppl, per_layer results, and the sensitivity curve.
+    """
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name, torch_dtype=torch.float16, device_map=device,
+        trust_remote_code=True,
+    )
+    model.eval()
+
+    n_layers = len(_get_decoder_layers(model))
+    print(f"Model has {n_layers} layers", flush=True)
+
+    # Tokenize eval texts
+    all_input_ids = []
+    for text in eval_texts:
+        ids = tokenizer.encode(text, truncation=True, max_length=max_tokens)
+        if len(ids) > 100:
+            all_input_ids.append(torch.tensor(ids, device=device))
+
+    # Baseline PPL (no quantization)
+    print("Computing baseline PPL...", flush=True)
+    baseline_ppl = _compute_hf_ppl(model, all_input_ids)
+    print(f"Baseline PPL: {baseline_ppl:.4f}", flush=True)
+
+    # Per-layer sensitivity
+    results = []
+    for target_layer in range(n_layers):
+        hook_handle = None
+
+        def make_quant_hook(layer_idx):
+            def hook_fn(module, args, kwargs, output):
+                if isinstance(output, tuple) and len(output) >= 3:
+                    past_kv = output[2]
+                    if past_kv is not None and isinstance(past_kv, tuple) and len(past_kv) == 2:
+                        k, v = past_kv
+                        # Quantize this layer's K/V
+                        orig_shape = k.shape
+                        k_flat = k.reshape(-1, k.shape[-1])
+                        v_flat = v.reshape(-1, v.shape[-1])
+                        k_q = simulate_turbo_quant_keys(k_flat, n_bits=key_bits)
+                        v_q = simulate_turbo_quant_values(v_flat, n_bits=value_bits)
+                        k_q = k_q.reshape(orig_shape)
+                        v_q = v_q.reshape(orig_shape)
+                        output = (output[0], output[1], (k_q, v_q)) + output[3:]
+                return output
+            return hook_fn
+
+        layer = _get_decoder_layers(model)[target_layer]
+        attn = _get_attention_module(layer)
+        if attn is not None:
+            hook_handle = attn.register_forward_hook(
+                make_quant_hook(target_layer), with_kwargs=True)
+
+        t0 = time.perf_counter()
+        layer_ppl = _compute_hf_ppl(model, all_input_ids)
+        elapsed = time.perf_counter() - t0
+
+        if hook_handle is not None:
+            hook_handle.remove()
+
+        delta_ppl = layer_ppl - baseline_ppl
+        results.append({
+            "layer": target_layer,
+            "ppl": round(layer_ppl, 4),
+            "delta_ppl": round(delta_ppl, 4),
+            "elapsed_s": round(elapsed, 1),
+        })
+        print(f"  Layer {target_layer:2d}: PPL={layer_ppl:.4f}  ΔPPL={delta_ppl:+.4f}  ({elapsed:.1f}s)",
+              flush=True)
+
+    del model
+    torch.cuda.empty_cache()
+
+    return {
+        "model": model_name,
+        "baseline_ppl": round(baseline_ppl, 4),
+        "key_bits": key_bits,
+        "value_bits": value_bits,
+        "n_eval_texts": len(all_input_ids),
+        "layers": results,
+    }
+
+
+def _compute_hf_ppl(model, input_ids_list: list[torch.Tensor]) -> float:
+    """Compute perplexity over a list of tokenized texts using HF model."""
+    total_nll = 0.0
+    total_tokens = 0
+
+    with torch.no_grad():
+        for input_ids in input_ids_list:
+            ids = input_ids.unsqueeze(0)
+            outputs = model(ids, labels=ids)
+            seq_len = ids.shape[1] - 1
+            total_nll += outputs.loss.item() * seq_len
+            total_tokens += seq_len
+
+    return math.exp(total_nll / total_tokens) if total_tokens else float('inf')
+
+
+# --------------------------------------------------------------------------
+# H1a test: Spearman correlation
+# --------------------------------------------------------------------------
+
+def compute_h1a_correlations(
+    features: list[LayerFeatures],
+    sensitivity: dict,
+) -> dict:
+    """Spearman rank correlation between each feature and ground-truth ΔPPL."""
+    from scipy.stats import spearmanr
+
+    delta_ppls = [layer["delta_ppl"] for layer in sensitivity["layers"]]
+    feature_names = [
+        "key_outlier_frac",
+        "post_wht_excess_kurtosis",
+        "key_norm_cv",
+        "value_dynamic_range",
+        "simulated_quant_error",
+    ]
+
+    results = {}
+    for fname in feature_names:
+        fvals = [getattr(f, fname) for f in features]
+        if any(math.isnan(v) for v in fvals):
+            results[fname] = {"rho": float('nan'), "p_value": float('nan'), "valid": False}
+            continue
+        rho, pval = spearmanr(fvals, delta_ppls)
+        results[fname] = {
+            "rho": round(rho, 4),
+            "p_value": round(pval, 6),
+            "valid": abs(rho) > 0.5 and pval < 0.05,
+        }
+    return results
+
+
+# --------------------------------------------------------------------------
+# Calibration data
+# --------------------------------------------------------------------------
+
+def load_calibration_texts(domain: str = "wiki", n_docs: int = 8) -> list[str]:
+    """Load calibration texts for feature extraction."""
+    from datasets import load_dataset
+
+    if domain == "wiki":
+        ds = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test")
+        text = "\n".join(row["text"] for row in ds if row["text"].strip())
+        words = text.split()
+        doc_size = len(words) // n_docs
+        return [" ".join(words[i * doc_size:(i + 1) * doc_size]) for i in range(n_docs)]
+
+    if domain == "code":
+        ds = load_dataset("codeparrot/github-code", split="train",
+                          streaming=True, languages=["Python"])
+        texts = []
+        for item in ds:
+            if len(item["code"]) > 500:
+                texts.append(item["code"][:4000])
+            if len(texts) >= n_docs:
+                break
+        return texts
+
+    raise ValueError(f"unknown domain: {domain}")
+
+
+# --------------------------------------------------------------------------
+# Full Experiment 0 pipeline
+# --------------------------------------------------------------------------
+
+def run_experiment_0(
+    model_name: str = "Qwen/Qwen3-4B",
+    key_bits: int = 3,
+    value_bits: int = 4,
+    n_calib_docs: int = 8,
+    n_eval_docs: int = 4,
+    max_tokens: int = 2048,
+    device: str = "cuda",
+    out_dir: str = "results/exp0",
+) -> None:
+    """Run the full Experiment 0 pipeline."""
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    # --- Step 1: Feature extraction ---
+    print("=" * 60)
+    print("Step 1: Extracting per-layer features from calibration data")
+    print("=" * 60)
+
+    calib_texts = load_calibration_texts("wiki", n_calib_docs)
+    t0 = time.perf_counter()
+    kv_data = extract_kv_per_layer(model_name, calib_texts[:2],
+                                    max_tokens=max_tokens, device=device)
+    print(f"K/V extraction took {time.perf_counter() - t0:.1f}s")
+
+    features = []
+    for layer_idx in sorted(kv_data.keys()):
+        kv = kv_data[layer_idx]
+        f = compute_features(
+            kv["keys"].to(device), kv["values"].to(device),
+            layer_idx, key_bits=key_bits, value_bits=value_bits,
+        )
+        features.append(f)
+        print(f"  Layer {layer_idx:2d}: outlier={f.key_outlier_frac:.3f}  "
+              f"kurtosis={f.post_wht_excess_kurtosis:.3f}  "
+              f"norm_cv={f.key_norm_cv:.3f}  "
+              f"dyn_range={f.value_dynamic_range:.3f}  "
+              f"quant_err={f.simulated_quant_error:.6f}")
+
+    del kv_data
+    torch.cuda.empty_cache()
+
+    features_data = [
+        {"layer": f.layer_idx, "key_outlier_frac": f.key_outlier_frac,
+         "post_wht_excess_kurtosis": f.post_wht_excess_kurtosis,
+         "key_norm_cv": f.key_norm_cv, "value_dynamic_range": f.value_dynamic_range,
+         "simulated_quant_error": f.simulated_quant_error}
+        for f in features
+    ]
+    (out / "features.json").write_text(json.dumps(features_data, indent=1))
+    print(f"\nFeatures saved to {out / 'features.json'}")
+
+    # --- Step 2: Ground-truth sensitivity ---
+    print("\n" + "=" * 60)
+    print("Step 2: Measuring per-layer sensitivity (ΔPPL)")
+    print("=" * 60)
+
+    eval_texts = load_calibration_texts("wiki", n_eval_docs)
+    sensitivity = measure_layer_sensitivity(
+        model_name, eval_texts, key_bits=key_bits, value_bits=value_bits,
+        max_tokens=max_tokens, device=device,
+    )
+    (out / "sensitivity.json").write_text(json.dumps(sensitivity, indent=1))
+    print(f"\nSensitivity saved to {out / 'sensitivity.json'}")
+
+    # --- Step 3: H1a correlations ---
+    print("\n" + "=" * 60)
+    print("Step 3: H1a test — Spearman correlations")
+    print("=" * 60)
+
+    correlations = compute_h1a_correlations(features, sensitivity)
+    for fname, result in correlations.items():
+        status = "PASS" if result["valid"] else "FAIL"
+        print(f"  {fname:<30s}  ρ={result['rho']:+.4f}  "
+              f"p={result['p_value']:.6f}  [{status}]")
+
+    # --- Step 4: Layer ranking ---
+    valid_features = [f for f, r in correlations.items() if r["valid"]]
+    if valid_features:
+        best_feature = max(valid_features, key=lambda f: abs(correlations[f]["rho"]))
+        ranking = sorted(range(len(features)),
+                         key=lambda i: getattr(features[i], best_feature),
+                         reverse=True)
+        policy = {
+            "method": "statistics-guided",
+            "feature": best_feature,
+            "rho": correlations[best_feature]["rho"],
+            "ranking": ranking,
+        }
+        print(f"\nH1a PASSED — best feature: {best_feature} "
+              f"(ρ={correlations[best_feature]['rho']:+.4f})")
+        print(f"Layer ranking (most sensitive first): {ranking[:10]}...")
+    else:
+        ranking = list(range(len(features)))
+        policy = {
+            "method": "positional",
+            "reason": "H1a failed — no feature passed correlation threshold",
+            "ranking": ranking,
+        }
+        print("\nH1a FAILED — falling back to positional protection")
+
+    exp0_result = {
+        "model": model_name,
+        "features": features_data,
+        "sensitivity": sensitivity,
+        "correlations": correlations,
+        "policy": policy,
+    }
+    (out / "exp0_result.json").write_text(json.dumps(exp0_result, indent=1))
+    print(f"\nFull Experiment 0 result saved to {out / 'exp0_result.json'}")
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+def main() -> None:
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--mode", choices=["features", "sensitivity", "full"],
+                   default="full")
+    p.add_argument("--model", default="Qwen/Qwen3-4B")
+    p.add_argument("--key-bits", type=int, default=3)
+    p.add_argument("--value-bits", type=int, default=4)
+    p.add_argument("--n-calib-docs", type=int, default=8)
+    p.add_argument("--n-eval-docs", type=int, default=4)
+    p.add_argument("--max-tokens", type=int, default=2048)
+    p.add_argument("--device", default="cuda")
+    p.add_argument("--out-dir", default="results/exp0")
+    args = p.parse_args()
+
+    if args.mode == "full":
+        run_experiment_0(
+            model_name=args.model, key_bits=args.key_bits,
+            value_bits=args.value_bits, n_calib_docs=args.n_calib_docs,
+            n_eval_docs=args.n_eval_docs, max_tokens=args.max_tokens,
+            device=args.device, out_dir=args.out_dir,
+        )
+    elif args.mode == "features":
+        calib_texts = load_calibration_texts("wiki", args.n_calib_docs)
+        kv_data = extract_kv_per_layer(args.model, calib_texts[:2],
+                                        max_tokens=args.max_tokens,
+                                        device=args.device)
+        for layer_idx in sorted(kv_data.keys()):
+            kv = kv_data[layer_idx]
+            f = compute_features(
+                kv["keys"].to(args.device), kv["values"].to(args.device),
+                layer_idx, key_bits=args.key_bits, value_bits=args.value_bits,
+            )
+            print(f"Layer {layer_idx:2d}: outlier={f.key_outlier_frac:.3f}  "
+                  f"kurtosis={f.post_wht_excess_kurtosis:.3f}  "
+                  f"norm_cv={f.key_norm_cv:.3f}  "
+                  f"dyn_range={f.value_dynamic_range:.3f}  "
+                  f"quant_err={f.simulated_quant_error:.6f}")
+    elif args.mode == "sensitivity":
+        eval_texts = load_calibration_texts("wiki", args.n_eval_docs)
+        result = measure_layer_sensitivity(
+            args.model, eval_texts, key_bits=args.key_bits,
+            value_bits=args.value_bits, max_tokens=args.max_tokens,
+            device=args.device,
+        )
+        out = Path(args.out_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "sensitivity.json").write_text(json.dumps(result, indent=1))
+
+
+if __name__ == "__main__":
+    main()
