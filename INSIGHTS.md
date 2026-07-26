@@ -171,6 +171,42 @@ Results in `results/cells/`.
     except k8v4/floor (0.95) and one 3bit_nc/stat_b6 rep (0.95). KV-cache
     quantization does not break simple retrieval even at aggressive settings.
 
+## Experiment 2 — Auto-tuner, Qwen3-4B, RTX 4090 (2026-07-26)
+
+Source: `src/tuner.py --optimize`, Optuna TPE over (preset, protection budget)
+with utility functions from SPEC §4. 20 unique (preset, budget) configs from
+Exp 1 + 16 refinement cells (k3v4_nc budgets 1-8, 4bit_nc budgets 1,3).
+PPL hard constraints: chat ≤0.5%, RAG ≤1%, batch ≤2%.
+
+37. **Each workload profile selects a different optimal config.** Chat → k8v4
+    (zero PPL loss, R_mem 2.25×); RAG → 4bit_nc + protect layer 5 (PPL +0.9%,
+    R_mem 2.82×); Batch → 4bit_nc floor-only (PPL +1.0%, R_mem 3.00×). A
+    single default config cannot serve all three — AutoTune's core premise.
+38. **RAG selects extra protection (n_protect=1)** — the only profile where the
+    tuner adds protection beyond the vLLM floor. Protecting layer 5 improves
+    4bit_nc PPL from 10.446 → 10.442, pushing utility from 1.52 to 1.54.
+    Marginal but measurable.
+39. **Layer 33 is the critical non-floor layer for aggressive presets.**
+    k3v4_nc PPL jumps from 10.662 → 10.570 when layer 33 is added (budget 1 →
+    budget 2). This single layer accounts for ~90% of all protection value.
+    After layer 33, diminishing returns plateau.
+40. **Protection has a sweet spot at budget 2-3 for k3v4_nc.** Budget 3
+    achieves the best PPL (10.561, recovering +0.106 from floor). Higher
+    budgets (4-8) show no improvement or slight regression — more protection
+    can hurt. Optimal budget is preset-dependent, not "protect as many as
+    possible."
+41. **k3v4_nc misses batch viability by 0.007 PPL.** Budget 3 gives PPL 10.561
+    vs threshold 10.554. Protection brought it 94% of the way (from gap=0.116
+    to gap=0.007). On a slightly less sensitive model, protection would flip
+    k3v4_nc to viable — demonstrating the threshold-crossing value of tuning.
+42. **Protection fixes k8v4 needle accuracy for free.** Floor-only k8v4 has
+    needle accuracy 0.95; budget 2 (protecting layers 5, 33) restores it to
+    1.00 with identical PPL (10.343). A quality improvement invisible to PPL.
+43. **Preset × protection interaction confirmed.** Aggressive presets (k3v4_nc,
+    3bit_nc) benefit from protection (+0.08-0.10 PPL recovery). Mild presets
+    (k8v4, 4bit_nc) show no measurable PPL effect (±0.007, noise). The optimal
+    protection budget is zero for mild presets and 2-3 for aggressive ones.
+
 ## Methodology / infrastructure lessons
 
 9. **vLLM v1 is multi-process**: `torch.cuda.max_memory_allocated()` in the
