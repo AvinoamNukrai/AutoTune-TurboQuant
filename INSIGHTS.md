@@ -250,6 +250,38 @@ correction across 30 tests.
     Without AutoTune, a user might try 3bit_nc for maximum compression
     and silently degrade quality beyond any acceptable limit.
 
+## Experiment 4 — Generalization spot-check, Qwen3-1.7B vs 4B, RTX 4090 (2026-07-26)
+
+Source: `analysis/exp4_generalization.py`, 10 cells = 5 configs × 2 reps on
+Qwen3-1.7B (28 layers). Same configs as Exp 3 primary model (Qwen3-4B, 36L).
+
+51. **Smaller models are far more sensitive to KV-cache quantization.**
+    dPPL on Qwen3-1.7B: 3bit_nc +54.6% (vs +3.4% on 4B — 16× worse),
+    4bit_nc +5.9% (vs +0.98% — 6× worse). The 1.7B model has less
+    redundancy per layer; quantization noise is amplified without spare
+    capacity to absorb it. 3bit_nc essentially collapses the model.
+52. **The optimal config is model-dependent.** RAG: 4bit_nc on 4B
+    (utility 1.62) vs k8v4 on 1.7B (utility 1.10) — 4bit_nc fails the
+    1% PPL threshold on 1.7B (dPPL=5.9%). Batch: 4bit_nc on 4B
+    (utility 1.15) vs baseline on 1.7B — no TQ preset is viable for batch
+    on 1.7B. A config tuned for one model would silently degrade quality
+    on another.
+53. **k8v4 shows quantization-as-regularization on the small model.**
+    dPPL = -2.03% on 1.7B (PPL improves from 13.43 to 13.16). FP8 keys +
+    4-bit uniform values act as noise injection that improves
+    generalization on the smaller, more overfitted model. On 4B the
+    effect is negligible (-0.02%).
+54. **Protection is more valuable on sensitive models.** 4bit_nc+L5 vs
+    4bit_nc: PPL recovery = 0.77 percentage points on 1.7B (5.90→5.13%)
+    vs 0.07 on 4B (0.98→0.91%). Protecting layer 5 recovers 11× more PPL
+    on the smaller model, consistent with finding #32 (protection scales
+    with quantization aggressiveness / model sensitivity).
+55. **Floor protection costs more on small models.** R_mem for 4bit_nc:
+    2.80× on 1.7B (4/28 = 14.3% floor) vs 3.00× on 4B (4/36 = 11.1%).
+    The fixed 4-layer floor is a larger fraction of the smaller model,
+    reducing effective compression — another reason per-model tuning
+    matters.
+
 ## Methodology / infrastructure lessons
 
 9. **vLLM v1 is multi-process**: `torch.cuda.max_memory_allocated()` in the
