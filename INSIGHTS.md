@@ -207,6 +207,49 @@ PPL hard constraints: chat ≤0.5%, RAG ≤1%, batch ≤2%.
     (k8v4, 4bit_nc) show no measurable PPL effect (±0.007, noise). The optimal
     protection budget is zero for mild presets and 2-3 for aggressive ones.
 
+## Experiment 3 — Validation, Qwen3-4B, RTX 4090 (2026-07-26)
+
+Source: `analysis/exp3_validation.py`, 30 cells = 6 configs × 5 reps on
+held-out traces (tag=valid, seed=20260726). Full SPEC §5.1 statistical
+protocol: paired t-test, Wilcoxon signed-rank, Cohen's d, Holm-Bonferroni
+correction across 30 tests.
+
+44. **AutoTune's primary value is workload-aware preset selection, not layer
+    protection.** Chat: k8v4 gives 2.25× compression at –0.02% PPL (utility
+    +19.4%). RAG: 4bit_nc gives 3.00× at +0.98% PPL (utility +57.6%).
+    Batch: 4bit_nc gives 3.00× at +0.98% PPL (utility +14.8%). All validated
+    on held-out traces not seen during screening or tuning.
+45. **Naive preset choice silently violates quality thresholds.** A user
+    applying 4bit_nc to chat gets dPPL=+0.98%, exceeding the 0.5% chat
+    threshold → utility drops to zero. AutoTune selects k8v4 for chat
+    (dPPL=–0.02%), avoiding the quality regression. This is the strongest
+    argument for per-profile tuning.
+46. **Layer protection does not improve utility on held-out data.** 4bit_nc
+    with floor-only protection (R_mem=3.00×, utility 1.62 RAG) beats
+    4bit_nc+L5 (R_mem=2.82×, utility 1.58). Protection improves PPL
+    (10.449→10.442) but costs R_mem, and since both configs pass the PPL
+    threshold, the PPL gain has zero utility value. Protection only matters
+    at threshold-crossing boundaries.
+47. **H1b is a negative result: stats-guided does not beat positional.**
+    Positional protection (L2, PPL 10.436) gives better PPL than
+    stats-guided (L5, PPL 10.442), significant on paired t-test (p<0.001).
+    Utility difference is not significant (p=0.33). Layer 5 has high
+    quant_error but zero sensitivity (finding #25) — the profiler's ranking
+    does not predict end-to-end protection value in vLLM.
+48. **PPL is deterministic across reps** — same model, same eval data,
+    teacher-forcing → identical PPL values in all 5 reps (CI ±0.000).
+    t-statistics are infinite for PPL comparisons. Latency metrics have
+    very low variance (TPOT ±0.01ms), confirming high system determinism
+    under offline single-GPU inference.
+49. **Wilcoxon is structurally underpowered at n=5 with Holm-Bonferroni.**
+    Minimum two-tailed p=0.0625; with 30 tests, minimum adjusted p=1.0.
+    Zero Wilcoxon tests survive correction. All 23 significant results
+    rely on the parametric paired t-test.
+50. **3bit_nc fails all profile thresholds on held-out data.** dPPL=+3.43%
+    exceeds even the batch threshold (2.0%). Utility=0 for all profiles.
+    Without AutoTune, a user might try 3bit_nc for maximum compression
+    and silently degrade quality beyond any acceptable limit.
+
 ## Methodology / infrastructure lessons
 
 9. **vLLM v1 is multi-process**: `torch.cuda.max_memory_allocated()` in the
