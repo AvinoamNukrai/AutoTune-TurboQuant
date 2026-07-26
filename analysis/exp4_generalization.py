@@ -1,8 +1,8 @@
-"""Experiment 4 — Generalization spot-check.
+"""Experiment 4 — Multi-model generalization spot-check.
 
-Compares Qwen3-4B (primary) vs Qwen3-1.7B (spot-check) on the same configs
-to show that the sensitivity map and optimum differ across models, establishing
-that per-context auto-tuning is necessary.
+Compares Qwen3-4B (primary) against multiple spot-check models on the same
+configs, showing that the sensitivity map and optimum differ across models
+and architectures. Establishes that per-context auto-tuning is necessary.
 
 Usage:
     python -m analysis.exp4_generalization [--cells-dir results/cells]
@@ -15,7 +15,10 @@ from collections import defaultdict
 from pathlib import Path
 
 EXP3_MANIFEST = Path("configs/grids/exp3.json")
-EXP4_MANIFEST = Path("configs/grids/exp4.json")
+EXP4_MANIFESTS = [
+    Path("configs/grids/exp4_all.json"),
+    Path("configs/grids/exp4.json"),
+]
 
 PROFILES = ["chat", "rag", "batch"]
 PPL_THRESHOLDS = {"chat": 0.005, "rag": 0.01, "batch": 0.02}
@@ -34,7 +37,17 @@ def config_key(cfg: dict) -> tuple:
             tuple(sorted(int(x) for x in cfg.get("skip_layers", []))))
 
 
+def detect_n_layers(cells: list[dict]) -> int | None:
+    for c in cells:
+        eff = c.get("effective_skip_layers", [])
+        if eff and len(eff) >= 4:
+            return max(int(x) for x in eff) + 1
+    return None
+
+
 def load_manifest_cells(manifest_path: Path, cells_dir: Path) -> list[dict]:
+    if not manifest_path.exists():
+        return []
     manifest = json.loads(manifest_path.read_text())
     from src.harness import CellConfig
     hashes = set()
@@ -113,7 +126,11 @@ def fmt(v, digits=2):
     return f"{v:.{digits}f}" if v is not None else "N/A"
 
 
-def analyze_model(cells: list[dict], model_name: str, n_layers: int):
+def short_model_name(model: str) -> str:
+    return model.split("/")[-1]
+
+
+def analyze_model(cells: list[dict], n_layers: int):
     grouped: dict[tuple, list[dict]] = defaultdict(list)
     for c in cells:
         key = config_key(c["config"])
@@ -158,106 +175,179 @@ def main():
     args = p.parse_args()
     cells_dir = Path(args.cells_dir)
 
+    # Load primary model (Qwen3-4B from Exp 3)
     exp3_cells = load_manifest_cells(EXP3_MANIFEST, cells_dir)
-    exp4_cells = load_manifest_cells(EXP4_MANIFEST, cells_dir)
+    primary, _ = analyze_model(exp3_cells, n_layers=36)
 
-    if not exp4_cells:
+    # Load all spot-check cells from any exp4 manifest
+    all_exp4_cells = []
+    for manifest in EXP4_MANIFESTS:
+        all_exp4_cells.extend(load_manifest_cells(manifest, cells_dir))
+
+    # Deduplicate by cell_hash
+    seen = set()
+    deduped = []
+    for c in all_exp4_cells:
+        h = c.get("cell_hash", id(c))
+        if h not in seen:
+            seen.add(h)
+            deduped.append(c)
+    all_exp4_cells = deduped
+
+    if not all_exp4_cells:
         print("No Exp 4 cells found. Run the manifest first.")
         return
 
-    print(f"Exp 3 cells: {len(exp3_cells)}, Exp 4 cells: {len(exp4_cells)}\n")
+    # Group by model
+    models: dict[str, list[dict]] = defaultdict(list)
+    for c in all_exp4_cells:
+        model = c["config"]["model"]
+        models[model].append(c)
 
-    primary, _ = analyze_model(exp3_cells, "Qwen3-4B", n_layers=36)
-    spot, _ = analyze_model(exp4_cells, "Qwen3-1.7B", n_layers=28)
+    model_names = sorted(models.keys())
+    short_names = {m: short_model_name(m) for m in model_names}
 
-    # Side-by-side comparison
-    print("=" * 110)
-    print("GENERALIZATION SPOT-CHECK: Qwen3-4B (primary) vs Qwen3-1.7B")
-    print("=" * 110)
-    print(f"{'Config':<20} {'PPL (4B)':>9} {'PPL (1.7B)':>10}  "
-          f"{'dPPL% 4B':>8} {'dPPL% 1.7B':>10}  "
-          f"{'R_mem 4B':>8} {'R_mem 1.7B':>10}")
-    print("-" * 110)
-
-    common_keys = sorted(set(primary.keys()) & set(spot.keys()))
-    for key in common_keys:
-        a = primary[key]
-        b = spot[key]
-        print(f"{a['label']:<20} {fmt(a['ppl'], 3):>9} {fmt(b['ppl'], 3):>10}  "
-              f"{fmt(a['dppl_pct'], 2):>7}% {fmt(b['dppl_pct'], 2):>9}%  "
-              f"{a['r_mem']:>7.2f}x {b['r_mem']:>9.2f}x")
+    print(f"Primary: Qwen3-4B ({len(exp3_cells)} cells)")
+    for m in model_names:
+        print(f"Spot-check: {short_names[m]} ({len(models[m])} cells)")
     print()
 
-    # Per-profile utility comparison
+    # Analyze each model
+    model_results = {}
+    for model in model_names:
+        cells = models[model]
+        n_layers = detect_n_layers(cells)
+        if n_layers is None:
+            print(f"WARNING: Could not detect layer count for {short_names[model]}, skipping")
+            continue
+        results, _ = analyze_model(cells, n_layers)
+        model_results[model] = {"results": results, "n_layers": n_layers}
+
+    if not model_results:
+        print("No valid models found.")
+        return
+
+    # -----------------------------------------------------------------------
+    # PPL sensitivity comparison across all models
+    # -----------------------------------------------------------------------
+    all_models = ["Qwen/Qwen3-4B"] + list(model_results.keys())
+    all_results = {"Qwen/Qwen3-4B": primary}
+    all_results.update({m: model_results[m]["results"] for m in model_results})
+    all_short = {"Qwen/Qwen3-4B": "Qwen3-4B"}
+    all_short.update(short_names)
+
+    common_keys = set(primary.keys())
+    for m in model_results:
+        common_keys &= set(model_results[m]["results"].keys())
+    common_keys = sorted(common_keys)
+
+    col_w = 12
+    header_models = "".join(f"{all_short[m]:>{col_w}}" for m in all_models)
+
+    print("=" * (20 + col_w * len(all_models) * 2 + 10))
+    print("dPPL% BY CONFIG × MODEL")
+    print("=" * (20 + col_w * len(all_models) * 2 + 10))
+    print(f"{'Config':<20}" + header_models)
+    print("-" * (20 + col_w * len(all_models)))
+
+    for key in common_keys:
+        label = all_results[all_models[0]][key]["label"]
+        vals = ""
+        for m in all_models:
+            dppl = all_results[m][key].get("dppl_pct")
+            vals += f"{fmt(dppl, 2) + '%':>{col_w}}"
+        print(f"{label:<20}{vals}")
+    print()
+
+    # -----------------------------------------------------------------------
+    # Per-profile utility × model matrix
+    # -----------------------------------------------------------------------
     for profile in PROFILES:
-        print(f"{'=' * 80}")
+        print("=" * (20 + col_w * len(all_models) + 20))
         print(f"UTILITY — {profile.upper()} (threshold dPPL ≤ {PPL_THRESHOLDS[profile]*100:.1f}%)")
-        print(f"{'=' * 80}")
-        print(f"{'Config':<20} {'Qwen3-4B':>12} {'Qwen3-1.7B':>12}  {'Same rank?':>10}")
-        print("-" * 80)
+        print("=" * (20 + col_w * len(all_models) + 20))
+        print(f"{'Config':<20}" + header_models + f"{'  Optimal on':>{20}}")
+        print("-" * (20 + col_w * len(all_models) + 20))
 
-        items = []
+        best_per_model = {}
+        for m in all_models:
+            best_u = -1
+            best_label = "?"
+            for key in common_keys:
+                u = all_results[m][key].get(f"util_{profile}")
+                if u is not None and u > best_u:
+                    best_u = u
+                    best_label = all_results[m][key]["label"]
+            best_per_model[m] = best_label
+
         for key in common_keys:
-            a = primary[key]
-            b = spot[key]
-            ua = a.get(f"util_{profile}")
-            ub = b.get(f"util_{profile}")
-            items.append((key, a["label"], ua, ub))
+            label = all_results[all_models[0]][key]["label"]
+            vals = ""
+            wins = []
+            for m in all_models:
+                u = all_results[m][key].get(f"util_{profile}")
+                vals += f"{fmt(u, 4):>{col_w}}"
+                if best_per_model[m] == label:
+                    wins.append(all_short[m])
+            win_str = ", ".join(wins) if wins else ""
+            print(f"{label:<20}{vals}  {win_str:>{18}}")
 
-        ranked_a = sorted(items, key=lambda x: -(x[2] or -1))
-        ranked_b = sorted(items, key=lambda x: -(x[3] or -1))
-        rank_a = {item[0]: i for i, item in enumerate(ranked_a)}
-        rank_b = {item[0]: i for i, item in enumerate(ranked_b)}
+        print()
+        print(f"  Optimal per model:")
+        for m in all_models:
+            print(f"    {all_short[m]:<25} → {best_per_model[m]}")
 
-        for key, label, ua, ub in items:
-            ra = rank_a.get(key, -1) + 1
-            rb = rank_b.get(key, -1) + 1
-            same = "YES" if ra == rb else f"#{ra}→#{rb}"
-            print(f"{label:<20} {fmt(ua, 4):>12} {fmt(ub, 4):>12}  {same:>10}")
-
-        best_a = ranked_a[0][1] if ranked_a else "?"
-        best_b = ranked_b[0][1] if ranked_b else "?"
-        differs = best_a != best_b
-        print(f"\n  Best for 4B:   {best_a}")
-        print(f"  Best for 1.7B: {best_b}")
-        print(f"  Optimum differs: {'YES' if differs else 'NO'}")
+        unique_optima = set(best_per_model.values())
+        if len(unique_optima) > 1:
+            print(f"  OPTIMUM DIFFERS across models ({len(unique_optima)} distinct)")
+        else:
+            print(f"  Same optimum across all models")
         print()
 
-    # Headline
+    # -----------------------------------------------------------------------
+    # Summary: which profiles show model-dependent optima?
+    # -----------------------------------------------------------------------
     print("=" * 80)
-    print("CONCLUSION")
+    print("CONCLUSION — MULTI-MODEL GENERALIZATION")
     print("=" * 80)
+
     any_differs = False
     for profile in PROFILES:
-        items = []
-        for key in common_keys:
-            a = primary[key]
-            b = spot[key]
-            ua = a.get(f"util_{profile}")
-            ub = b.get(f"util_{profile}")
-            items.append((key, ua, ub))
-        best_a = max(items, key=lambda x: x[1] or -1)[0] if items else None
-        best_b = max(items, key=lambda x: x[2] or -1)[0] if items else None
-        if best_a != best_b:
+        best_per_model = {}
+        for m in all_models:
+            best_u = -1
+            best_key = None
+            for key in common_keys:
+                u = all_results[m][key].get(f"util_{profile}")
+                if u is not None and u > best_u:
+                    best_u = u
+                    best_key = key
+            best_per_model[m] = best_key
+
+        unique = set(best_per_model.values())
+        if len(unique) > 1:
             any_differs = True
-            print(f"  {profile}: optimal config DIFFERS between models")
+            print(f"  {profile}: DIFFERS — {len(unique)} distinct optimal configs")
         else:
-            print(f"  {profile}: same optimal config on both models")
+            print(f"  {profile}: same optimal across all models")
 
     if any_differs:
-        print("\n  -> Per-context auto-tuning is necessary: the optimal config")
-        print("     is model-dependent. A config tuned for one model does not")
-        print("     transfer to another.")
+        print()
+        print("  -> The optimal TurboQuant config is model-dependent.")
+        print("     Per-context auto-tuning is necessary.")
     else:
-        print("\n  -> Optimal configs match across models. The PPL sensitivity")
-        print("     profile may still differ (check dPPL% columns above).")
+        print()
+        print("  -> Same optimum across models, but dPPL% differs significantly.")
+        print("     The safety margin is model-dependent.")
 
+    # Save
     out = Path("results/exp4_generalization.json")
     out.parent.mkdir(parents=True, exist_ok=True)
-    data = {
-        "primary": {str(k): v for k, v in primary.items()},
-        "spot_check": {str(k): v for k, v in spot.items()},
-    }
+    data = {}
+    for m in all_models:
+        data[all_short[m]] = {
+            str(k): v for k, v in all_results[m].items() if k in common_keys
+        }
     out.write_text(json.dumps(data, indent=1, default=str))
     print(f"\nResults saved to {out}")
 
