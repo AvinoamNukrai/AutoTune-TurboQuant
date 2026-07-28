@@ -1,0 +1,17 @@
+{
+  "chat": {
+    "description": "Interactive chat — short input, long output, TPOT-sensitive",
+    "terms": [["s_tpot", 0.7], ["r_mem", 0.3]],
+    "ppl_threshold": 0.005
+  },
+  "rag": {
+    "description": "Retrieval-augmented generation — long input, short output, memory+TTFT",
+    "terms": [["r_mem", 0.5], ["s_ttft", 0.5]],
+    "ppl_threshold": 0.01
+  },
+  "batch": {
+    "description": "Bulk offline processing — throughput-maximizing",
+    "terms": [["s_tp", 0.8], ["r_mem", 0.2]],
+    "ppl_threshold": 0.02
+  }
+}

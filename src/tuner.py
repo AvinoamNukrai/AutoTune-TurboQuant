@@ -1,17 +1,18 @@
-"""Experiment 2: Optuna auto-tuner for TurboQuant configuration.
+"""Workload-aware tuner for KV cache compression configuration.
 
-Uses Experiment 1 cells as warm-start data, computes per-profile utility
-(SPEC Section 4), and runs Optuna TPE to suggest refinement trials that
-explore untested (preset, protection budget) combinations.
+Searches the (preset × layer-protection budget) space to find the
+configuration that maximizes a workload-specific utility function
+while staying within a perplexity degradation threshold. The utility
+functions and thresholds are loaded from ``configs/profiles.json``
+and can be overridden per-deployment.
 
-Modes:
+Uses Experiment 1 cells as warm-start data and Optuna TPE for
+refinement search.
+
+CLI:
     python -m src.tuner --analyze              # utilities from existing cells
     python -m src.tuner --suggest 16           # generate refinement manifest
     python -m src.tuner --optimize             # full analysis + optimal configs
-
-The tuner searches over:
-    - preset: categorical [k8v4, 4bit_nc, k3v4_nc, 3bit_nc]
-    - n_protect: int [0..8], extra layers beyond floor, chosen by profiler ranking
 """
 from __future__ import annotations
 
@@ -41,20 +42,9 @@ BYTES_PER_DIM = {
     "3bit_nc": 0.75,
 }
 
-PROFILES_CFG = {
-    "chat": {
-        "terms": [("s_tpot", 0.7), ("r_mem", 0.3)],
-        "ppl_threshold": 0.005,
-    },
-    "rag": {
-        "terms": [("r_mem", 0.5), ("s_ttft", 0.5)],
-        "ppl_threshold": 0.01,
-    },
-    "batch": {
-        "terms": [("s_tp", 0.8), ("r_mem", 0.2)],
-        "ppl_threshold": 0.02,
-    },
-}
+from .profiles import load_profiles
+
+PROFILES_CFG = load_profiles()
 
 # ---------------------------------------------------------------------------
 # Layer ranking (loaded from Exp 0 or fallback)

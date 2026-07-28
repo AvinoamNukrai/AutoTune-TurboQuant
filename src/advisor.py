@@ -1,13 +1,14 @@
-"""Config Advisor — recommend vLLM launch flags for a given workload.
+"""Config Advisor — recommend vLLM KV cache compression settings.
 
-Loads the optimal configs produced by the tuner (results/optimal_configs.json)
-and emits the vLLM CLI flags or Python kwargs, along with an evidence trail
-explaining *why* this config was selected.
+Given a workload profile (chat/rag/batch), outputs the optimal
+TurboQuant preset and layer protection list, along with evidence
+(PPL delta, utility score, latency) explaining the recommendation.
 
-Usage:
+Reads from ``results/optimal_configs.json`` produced by the tuner.
+
+CLI:
     python -m src.advisor --profile chat
     python -m src.advisor --profile rag --format python
-    python -m src.advisor --profile batch --format cli
     python -m src.advisor --all
 """
 from __future__ import annotations
@@ -25,7 +26,10 @@ PROFILE_DESCRIPTIONS = {
     "batch": "Bulk offline processing — throughput-maximizing (dPPL ≤ 2.0%)",
 }
 
-PPL_THRESHOLDS = {"chat": 0.5, "rag": 1.0, "batch": 2.0}
+from .profiles import load_profiles
+
+_PROFILES = load_profiles()
+PPL_THRESHOLDS = {name: cfg["ppl_threshold"] * 100 for name, cfg in _PROFILES.items()}
 
 
 def load_configs(path: Path) -> dict:

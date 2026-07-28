@@ -1,4 +1,4 @@
-# AutoTuneTurboQuant: Configuration-Space Characterization and Workload-Aware Auto-Tuning of TurboQuant KV-Cache Quantization in vLLM
+# KVCompressionTune: Workload-Aware KV-Cache Compression Policy for vLLM
 
 **Technical Specification & Execution Plan**
 
@@ -16,17 +16,16 @@
 
 ### 1.1 Project Scope
 
-**AutoTuneTurboQuant** is a framework that automatically identifies the optimal TurboQuant KV-cache quantization configuration for a given combination of **model, GPU hardware, and workload** — replacing the manually chosen, one-size-fits-all defaults shipped in vLLM.
+**KVCompressionTune** investigates whether **compression policy** matters for KV cache management in LLM serving — not just whether to compress, but **where** (which layers) and **how much** (which bit-width).
 
-The project has two layers, deliberately ordered:
+We prove three hypotheses:
+1. **Layer sensitivity is non-uniform.** Some layers tolerate aggressive quantization (3-bit) with negligible quality loss; others suffer catastrophic degradation. A uniform compression policy is suboptimal.
+2. **Sensitivity is model-dependent.** The same quantization preset that works for a 4B model can destroy a 1.7B model. There is no universal "safe" preset.
+3. **The optimal compression strategy depends on the workload.** Chat (latency-sensitive, strict quality) and batch (throughput-sensitive, lenient quality) demand different configurations from the same model.
 
-1. **Configuration-Space Characterization (the scientific foundation).** A systematic empirical study of *all* TurboQuant parameters reachable on stock vLLM: how large the configuration space really is, how much each parameter affects accuracy, memory, latency, and throughput, and which interactions exist between parameters. No parameter is assumed unimportant in advance — importance is a *measured output* of this phase, not an input assumption.
+These findings establish that **adaptive compression depth is a necessary complement to eviction-based KV cache management**. While eviction policies (PagedAttention, PrefixCache) decide *which* cache entries to keep, our work addresses *how* to represent the entries that are kept — a different, complementary layer of cache optimization.
 
-2. **AutoTuneTurboQuant (the system).** A Bayesian-optimization auto-tuner (Optuna) that concentrates its search on the parameters and interactions the characterization proved significant, and produces per-(model, GPU, workload) optimal configurations together with the empirical evidence for *why* they are optimal.
-
-The result is not "an Optuna loop over some knobs," but an auto-tuner grounded in a documented empirical understanding of the system it tunes.
-
-**Scope constraint:** the core project runs entirely on **unmodified stock vLLM**. Every experiment and every tuned configuration is reproducible with `pip install vllm` — no forks, no patches. An upstream-contribution track (Section 9) exists as a bonus if time permits, but the central contribution does not depend on it.
+TurboQuant (vLLM's built-in KV cache quantization) serves as the experimental vehicle. The contribution is the finding, the methodology, and the practical tool — not TurboQuant itself.
 
 ### 1.2 Problem Statement
 
@@ -43,7 +42,7 @@ Yet vLLM users today must pick a preset by hand, and the layer-protection rule i
 
 ### 1.3 The Claim to Fame
 
-> We present the first systematic characterization of TurboQuant's configuration space in vLLM — quantifying each parameter's impact and the interactions between them — and show that the optimal configuration, in particular the layer-protection structure, depends measurably on the model, the GPU, and the workload. AutoTuneTurboQuant turns this empirical map into an automatic tuner that outperforms vLLM's hand-picked defaults on every workload profile tested.
+> We prove that KV-cache compression policy matters — layer sensitivity is non-uniform, model-dependent, and workload-dependent. We present the first systematic characterization of TurboQuant's configuration space in vLLM, showing that the optimal configuration depends measurably on the model, the GPU, and the workload. The system turns this empirical map into a workload-aware tuner that outperforms vLLM's hand-picked defaults on every profile tested.
 
 ### 1.4 Positioning: A Research Contribution, Not a Wrapper
 
@@ -51,10 +50,19 @@ A wrapper calls an existing API with parameters someone else chose. This project
 
 1. **The empirical map.** vLLM ships the mechanism; no one — including the vLLM maintainers, per their own hard-coded `n=2` boundary rule — has published a sensitivity analysis of the TurboQuant parameter space across models, GPUs, and workloads. The characterization study is new knowledge, not repackaging.
 2. **The measured challenge to shipped defaults.** The project directly tests assumptions baked into upstream code (fixed presets, fixed boundary width) and quantifies when they are wrong and by how much.
-3. **The automation.** AutoTuneTurboQuant converts the map into a decision procedure: given (model, GPU, workload), it outputs the configuration and the evidence. vLLM has no such capability.
+3. **The automation.** KVCompressionTune converts the map into a decision procedure: given (model, GPU, workload), it outputs the configuration and the evidence. vLLM has no such capability.
 4. **The tuner itself is evidence-driven.** Its search space and priors are outputs of the characterization phase — a methodological contribution over blind hyperparameter search.
 
-**One-sentence positioning:** *vLLM ships TurboQuant with hand-picked defaults; AutoTuneTurboQuant replaces those defaults with configurations chosen automatically from a measured understanding of what actually matters.*
+**One-sentence positioning:** *vLLM ships TurboQuant with hand-picked defaults; this project proves those defaults are suboptimal and replaces them with configurations chosen from a measured understanding of what actually matters — per model, per GPU, per workload.*
+
+### 1.5 Related Work
+
+Per-layer sensitivity analysis for quantization is established in the weight-quantization literature:
+- **HAWQ** (Dong et al., 2019) uses Hessian-based sensitivity to assign mixed precision to weights — the same principle of "not all layers are equal" that we apply to KV cache.
+- **KIVI** (Liu et al., 2024) proposes per-channel key quantization and per-token value quantization for KV cache, with layer-level sensitivity analysis.
+- **KVQuant** (Hooper et al., 2024) introduces outlier-aware KV cache quantization with per-layer calibration.
+
+Our work differs in three ways: (1) we target vLLM's TurboQuant specifically, which is the only sub-8-bit KV cache quantization available on Ada GPUs (RTX 4090); (2) we combine layer sensitivity with workload-aware utility functions that balance speed, memory, and quality differently per use case; (3) we deliver a practical CLI tool that outputs ready-to-use vLLM launch commands.
 
 ---
 
@@ -96,7 +104,7 @@ The system is a pipeline of four decoupled components, all operating on **unmodi
 
 ### 2.1 Configuration Application Granularity
 
-All TurboQuant parameters in vLLM are **engine-startup parameters** (the KV-cache pool is allocated once, with fixed bytes-per-token). Accordingly, AutoTuneTurboQuant applies configurations at **engine-launch granularity**: the advisor emits the flags for `vllm serve` / `LLM(...)`, and "workload-aware" means the right configuration is selected per deployment context. Live per-request re-configuration is out of scope (see Section 10, Future Work) — it would require modifying vLLM's cache allocator and attention kernels, conflicting with the stock-vLLM constraint.
+All TurboQuant parameters in vLLM are **engine-startup parameters** (the KV-cache pool is allocated once, with fixed bytes-per-token). Accordingly, KVCompressionTune applies configurations at **engine-launch granularity**: the advisor emits the flags for `vllm serve` / `LLM(...)`, and "workload-aware" means the right configuration is selected per deployment context. Live per-request re-configuration is out of scope (see Section 10, Future Work) — it would require modifying vLLM's cache allocator and attention kernels, conflicting with the stock-vLLM constraint.
 
 ---
 
@@ -151,7 +159,7 @@ vLLM's hard-coded rule protects layers by *position* (first 2 + last 2). Communi
 
 **Validation protocol (Experiment 0):** ground-truth per-layer sensitivity is measured by simulated quantization of one layer at a time (ΔPPL per layer); H1a is then Spearman correlation of each feature against this curve, plus a stability report (rank correlation of feature-derived rankings across disjoint, cross-domain calibration slices). The ranking policy is built **only from features that pass both tests**. H1b is then tested end-to-end on real vLLM in Experiment 1 via matched-budget cells — necessary because simulated quantization reproduces vLLM's math but not its kernels.
 
-**Fallback:** if no feature passes (H1a fails) or the ranking does not beat position at matched budgets (H1b fails), AutoTuneTurboQuant ships with tuned positional protection — a negative result on H1 is itself a reportable finding, and the system's framing is unchanged either way.
+**Fallback:** if no feature passes (H1a fails) or the ranking does not beat position at matched budgets (H1b fails), KVCompressionTune ships with tuned positional protection — a negative result on H1 is itself a reportable finding, and the system's framing is unchanged either way.
 
 ---
 

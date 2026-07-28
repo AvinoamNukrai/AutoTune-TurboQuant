@@ -103,3 +103,26 @@ def test_features_quant_error_sensitive_to_outliers():
     f_normal = compute_features(normal_keys, torch.randn(100, 4, 64), 0)
     f_outlier = compute_features(outlier_keys, torch.randn(100, 4, 64), 1)
     assert f_outlier.simulated_quant_error > f_normal.simulated_quant_error
+
+
+def test_fallback_implementations_exist():
+    """Our fallback functions must exist regardless of vLLM availability."""
+    from src.profiler import (
+        hadamard_matrix,
+        simulate_turbo_quant_keys,
+        simulate_turbo_quant_values,
+        load_centroids,
+    )
+    H = hadamard_matrix(16)
+    assert H.shape == (16, 16)
+
+    c = load_centroids(3)
+    assert len(c) == 8
+
+    keys = torch.randn(10, 16)
+    restored = simulate_turbo_quant_keys(keys, n_bits=3)
+    assert restored.shape == keys.shape
+
+    values = torch.randn(10, 16)
+    restored_v = simulate_turbo_quant_values(values, n_bits=4)
+    assert restored_v.shape == values.shape

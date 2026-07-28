@@ -282,6 +282,33 @@ Qwen3-1.7B (28 layers). Same configs as Exp 3 primary model (Qwen3-4B, 36L).
     reducing effective compression — another reason per-model tuning
     matters.
 
+## Profiler methodology — refactoring insights (2026-07-28)
+
+56. **Simulation mode reimplements TurboQuant math in pure PyTorch** (~100 lines:
+    Hadamard rotation + Lloyd-Max centroids for keys, uniform quantization for
+    values). This was originally the only profiling method. The reimplementation
+    replicates vLLM's CUDA kernel logic in Python for per-layer hook-based
+    profiling via HuggingFace Transformers. vLLM's quantization CUDA kernels
+    cannot be called from HuggingFace hooks — they operate inside vLLM's engine,
+    not as standalone Python functions. The simulation is documented as a
+    fallback, not a replacement for vLLM.
+57. **vLLM ground-truth mode added** (`--mode vllm`): generates a harness manifest
+    where each cell quantizes ONLY one layer through vLLM's actual engine via
+    `kv_cache_dtype_skip_layers` (all other layers protected as FP16). No
+    simulation — uses real CUDA kernels. Slower (~1.5h for 36 layers) but
+    provides ground truth to validate the simulation results from Experiment 0.
+    Two-step workflow: `--mode vllm` generates the manifest, run through
+    harness, then `--mode vllm-analyze` computes the sensitivity ranking.
+58. **Utility parameters extracted to config** (`configs/profiles.json`). PPL
+    thresholds and utility function exponents were hard-coded identically in
+    4 files (`tuner.py`, `advisor.py`, `exp3_validation.py`,
+    `exp4_generalization.py`). Now loaded from a single JSON file with a shared
+    loader module (`src/profiles.py`) — defaults baked in as fallback.
+59. **Legacy CLI modes renamed for clarity.** `--mode sensitivity` → `--mode
+    sim-sensitivity`, `--mode full` → `--mode sim-full` (old names kept as
+    aliases). New modes: `--mode vllm`, `--mode vllm-analyze`. Makes explicit
+    which backend (simulation vs vLLM engine) is being used.
+
 ## Methodology / infrastructure lessons
 
 9. **vLLM v1 is multi-process**: `torch.cuda.max_memory_allocated()` in the

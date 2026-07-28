@@ -31,7 +31,12 @@ BYTES_PER_KV = {
     "turboquant_3bit_nc": 0.75,
 }
 
-PPL_THRESHOLDS = {"chat": 0.005, "rag": 0.01, "batch": 0.02}
+import sys
+sys.path.insert(0, ".")
+from src.profiles import load_profiles
+
+_PROFILES = load_profiles()
+PPL_THRESHOLDS = {name: cfg["ppl_threshold"] for name, cfg in _PROFILES.items()}
 
 PROFILE_NAMES = ["chat", "rag", "batch"]
 

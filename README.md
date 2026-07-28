@@ -1,53 +1,45 @@
-# AutoTuneTurboQuant
+# KVCompressionTune
 
-Configuration-space characterization and workload-aware auto-tuning of
-**TurboQuant KV-cache quantization** in stock [vLLM](https://github.com/vllm-project/vllm).
+**Course:** LLM Caching — Final Project  
+**Author:** Avinoam Nukrai  
+**Baseline:** Stock vLLM (>= 0.20) with TurboQuant KV-cache quantization
 
-Given a (model, GPU, workload) combination, AutoTuneTurboQuant finds the optimal
-TurboQuant configuration — preset, layer-protection set, and kernel parameters —
-instead of relying on vLLM's hand-picked defaults. The layer-protection policy is
-derived from measured per-layer sensitivity statistics (see [SPEC.md](SPEC.md) for
-the full technical specification and experimental program).
+---
 
-**Baseline:** unmodified vLLM 0.20.2 (TurboQuant merged upstream in
-[vllm#38479](https://github.com/vllm-project/vllm/pull/38479)).
-**Primary target:** Qwen3-4B on NVIDIA RTX 3090 (24 GB).
+## What This Project Investigates
 
-## Setup (one-time, on a GPU machine)
+vLLM ships TurboQuant KV-cache quantization with **4 fixed presets** and a **hard-coded layer-protection rule** (first 2 + last 2 layers stay FP16). These defaults were validated on a handful of Qwen models. Nobody has asked: *does compression policy actually matter?*
 
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
+This project proves that it does. We show three things:
 
-## Phase 1 — smoke test
+1. **Layer sensitivity is non-uniform.** Layer 0 of Qwen3-4B is 10x more sensitive to quantization than any other layer. Layer 1 (protected by default) is essentially insensitive. The fixed protection rule wastes budget on safe layers and leaves sensitive layers exposed.
 
-Verifies all TurboQuant presets on the actual GPU, probes the
-`--kv-cache-dtype-skip-layers` behavior (including whether the hard-coded
-boundary-protection floor can be disabled), and measures real per-cell cost
-for the experiment budget.
+2. **Sensitivity is model-dependent.** 3-bit quantization costs +3.4% PPL on Qwen3-4B but +54.6% on Qwen3-1.7B — a 16x difference. The same preset that works on one model destroys another. There is no universal safe choice.
 
-```bash
-python scripts/smoke_test.py
-```
+3. **The optimal config depends on the workload.** Chat (latency-sensitive, strict quality) selects k8v4. RAG (memory-sensitive) selects 4bit_nc. Batch (throughput-maximizing) selects 4bit_nc with fewer protections. A single default cannot serve all three.
 
-Output: `results/smoke_test.json` + a summary table to stdout.
-Exit code 0 = all configs passed.
+## How It Works
 
-## Repository layout
+The system has four components, all running on **unmodified stock vLLM**:
 
-```
-SPEC.md                   full technical specification & experimental program
-scripts/smoke_test.py     Phase 1: preset verification + cost measurement
-docker/Dockerfile         reproducibility image (vLLM base + analysis deps)
-src/                      (Phase 2+) profiler, harness, tuner, advisor
-results/                  benchmark outputs (JSON/CSV)
-```
+- **Layer Sensitivity Profiler** (`src/profiler.py`) — measures per-layer sensitivity to quantization. Two backends: a fast simulation mode (~5 min, pure PyTorch reimplementation of TurboQuant math) and a vLLM ground-truth mode (~1.5h, runs the actual engine per-layer via `kv_cache_dtype_skip_layers`).
 
-## How to benchmark
+- **Benchmark Harness** (`src/harness.py`) — launches vLLM with a given config, replays frozen workload traces, collects PPL/latency/VRAM. Content-addressed checkpointing — rerunning skips completed cells.
 
-Full instructions land with the Phase-2 harness. The design contract:
-every experiment cell is checkpointed by config-hash — reruns skip
-completed cells, and all analysis runs offline from the CSVs (zero GPU cost
-to iterate on figures/statistics).
+- **Workload-Aware Tuner** (`src/tuner.py`) — searches the (preset x layer-protection budget) space using Optuna, guided by workload-specific utility functions that balance speed, memory, and quality differently per use case (chat/rag/batch).
+
+- **Config Advisor** (`src/advisor.py`) — given a workload profile, outputs the recommended vLLM launch flags with evidence trail explaining why.
+
+## Key Findings
+
+| Workload | Optimal Preset | Compression | PPL Delta | vs Default |
+|----------|---------------|-------------|-----------|------------|
+| Chat     | k8v4          | 2.25x       | -0.02%    | Prevents quality violation (+0.98% with naive 4bit) |
+| RAG      | 4bit_nc       | 3.00x       | +0.98%    | +57.6% utility over baseline |
+| Batch    | 4bit_nc       | 3.00x       | +0.98%    | +14.8% utility over baseline |
+
+TurboQuant is the experimental vehicle. The contribution is the finding (compression policy matters), the methodology (per-layer sensitivity + workload-aware utility), and the practical tool.
+
+## Technical Details
+
+See [SPEC.md](SPEC.md) for the full specification, experimental protocol, and statistical methodology. See [INSIGHTS.md](INSIGHTS.md) for the chronological findings log.

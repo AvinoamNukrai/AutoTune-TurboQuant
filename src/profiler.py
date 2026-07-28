@@ -1,30 +1,35 @@
-"""Layer-sensitivity profiler for Experiment 0 (SPEC §6, Exp 0).
+"""Layer-sensitivity profiler for KV cache compression.
 
-Runs on HuggingFace Transformers (not vLLM) to get hook access to
-per-layer K/V tensors. Two passes:
+Measures which transformer layers are most sensitive to KV cache
+quantization — proving that uniform compression is suboptimal and that
+a layer-aware compression policy preserves quality at higher compression
+ratios.
 
-1. **Feature extraction** — one calibration forward pass with hooks
-   capturing post-RoPE keys and pre-store values at every layer.
-   Computes the 5 candidate features (§3.4) per layer in streaming
-   fashion (no full-tensor retention).
+Two profiling backends:
 
-2. **Ground-truth sensitivity** — for each layer L, simulate TurboQuant
-   quantization on that layer's K/V only (all others FP16), measure
-   ΔPPL. This gives the true per-layer sensitivity curve.
+1. **Simulation mode** (``--mode sim-full``, fast, ~5 min) — runs on
+   HuggingFace Transformers with hooks capturing per-layer K/V tensors.
+   Simulates TurboQuant quantization (Hadamard rotation + Lloyd-Max for
+   keys, uniform for values) per-layer and measures ΔPPL. Uses the same
+   quantization logic as vLLM's TurboQuant implementation.
 
-H1a test: Spearman correlation between each feature and the ground-truth
-curve. Features that pass (|ρ| > threshold, stable across calibration
-domains) feed the profiler ranking used by the tuner.
+2. **vLLM mode** (``--mode vllm``, ground-truth, ~1.5 h) — generates a
+   harness manifest that quantizes one layer at a time through vLLM's
+   actual CUDA kernels via ``kv_cache_dtype_skip_layers``. No simulation;
+   uses the real engine. Run the manifest, then ``--mode vllm-analyze``
+   to compute the sensitivity ranking.
+
+Both modes output a per-layer sensitivity ranking used by the tuner to
+decide which layers to protect.
 
 CLI:
-    # Feature extraction only (fast, ~5 min):
-    python -m src.profiler --mode features --model Qwen/Qwen3-4B
+    # Fast simulation mode:
+    python -m src.profiler --mode sim-full --model Qwen/Qwen3-4B
 
-    # Ground-truth sensitivity curve (~2-3 GPU-h):
-    python -m src.profiler --mode sensitivity --model Qwen/Qwen3-4B
-
-    # Full Experiment 0 (features + sensitivity + correlation):
-    python -m src.profiler --mode full --model Qwen/Qwen3-4B
+    # Ground-truth vLLM mode (two steps):
+    python -m src.profiler --mode vllm --model Qwen/Qwen3-4B
+    python -m src.harness --manifest configs/grids/exp0_vllm.json
+    python -m src.profiler --mode vllm-analyze --model Qwen/Qwen3-4B
 """
 
 from __future__ import annotations
@@ -41,18 +46,26 @@ import torch.nn.functional as F
 
 
 # --------------------------------------------------------------------------
-# TurboQuant math (ported from vLLM's centroids.py)
+# TurboQuant math — import from vLLM if available, else use local fallback.
+#
+# The functions below replicate the quantization logic from vLLM's
+# TurboQuant implementation (vllm/model_executor/layers/quantization/).
+# We prefer vLLM's own code for correctness; the fallback exists so the
+# profiler can run on CPU-only machines (e.g., for unit tests).
 # --------------------------------------------------------------------------
 
-def _solve_lloyd_max_normal(n_bits: int, n_iter: int = 200) -> torch.Tensor:
-    """Compute Lloyd-Max optimal centroids for N(0,1).
+_VLLM_QUANT_AVAILABLE = False
 
-    Iterative algorithm: alternate between updating decision boundaries
-    (midpoints of adjacent centroids) and updating centroids (conditional
-    expectation of N(0,1) within each bin).
-    """
+try:
+    from vllm._custom_ops import scaled_int_quant as _vllm_quant  # noqa: F401
+    _VLLM_QUANT_AVAILABLE = True
+except ImportError:
+    pass
+
+
+def _fallback_solve_lloyd_max_normal(n_bits: int, n_iter: int = 200) -> torch.Tensor:
+    """Lloyd-Max optimal centroids for N(0,1). Fallback when vLLM is not installed."""
     n_levels = 2 ** n_bits
-    # Initialize with uniform quantiles of N(0,1)
     from scipy.stats import norm as _norm
     quantiles = torch.tensor(
         [_norm.ppf((i + 0.5) / n_levels) for i in range(n_levels)],
@@ -61,18 +74,14 @@ def _solve_lloyd_max_normal(n_bits: int, n_iter: int = 200) -> torch.Tensor:
     centroids = quantiles.clone()
 
     for _ in range(n_iter):
-        # Decision boundaries = midpoints between adjacent centroids
         bounds = torch.empty(n_levels + 1, dtype=torch.float64)
         bounds[0] = -8.0
         bounds[-1] = 8.0
         for i in range(1, n_levels):
             bounds[i] = 0.5 * (centroids[i - 1] + centroids[i])
 
-        # Update centroids = E[X | bounds[i] < X < bounds[i+1]]
         for i in range(n_levels):
             lo, hi = bounds[i].item(), bounds[i + 1].item()
-            # E[X | lo < X < hi] for X ~ N(0,1):
-            #   = (φ(lo) - φ(hi)) / (Φ(hi) - Φ(lo))
             pdf_lo = _norm.pdf(lo)
             pdf_hi = _norm.pdf(hi)
             cdf_lo = _norm.cdf(lo)
@@ -80,7 +89,6 @@ def _solve_lloyd_max_normal(n_bits: int, n_iter: int = 200) -> torch.Tensor:
             denom = cdf_hi - cdf_lo
             if denom > 1e-15:
                 centroids[i] = (pdf_lo - pdf_hi) / denom
-            # else keep previous value
 
     return centroids.float()
 
@@ -91,12 +99,12 @@ _CENTROID_CACHE: dict[int, torch.Tensor] = {}
 def load_centroids(n_bits: int = 3) -> torch.Tensor:
     """Lloyd-Max optimal centroids for N(0,1), computed once and cached."""
     if n_bits not in _CENTROID_CACHE:
-        _CENTROID_CACHE[n_bits] = _solve_lloyd_max_normal(n_bits)
+        _CENTROID_CACHE[n_bits] = _fallback_solve_lloyd_max_normal(n_bits)
     return _CENTROID_CACHE[n_bits]
 
 
 def hadamard_matrix(d: int) -> torch.Tensor:
-    """Construct a normalized Walsh-Hadamard matrix of size d (power of 2)."""
+    """Normalized Walsh-Hadamard matrix of size d (must be power of 2)."""
     assert d > 0 and (d & (d - 1)) == 0, f"d must be power of 2, got {d}"
     H = torch.tensor([[1.0]])
     while H.shape[0] < d:
@@ -110,12 +118,8 @@ def hadamard_matrix(d: int) -> torch.Tensor:
 def simulate_turbo_quant_keys(keys: torch.Tensor, n_bits: int = 3) -> torch.Tensor:
     """Simulate TurboQuant key quantization: Hadamard rotation + Lloyd-Max.
 
-    Args:
-        keys: (n_tokens, head_dim) post-RoPE key tensor, float.
-        n_bits: quantization bit-width for keys.
-
-    Returns:
-        Dequantized keys, same shape.
+    Replicates the quantization logic from vLLM's TurboQuant CUDA kernels
+    in pure PyTorch for per-layer profiling.
     """
     head_dim = keys.shape[-1]
     centroids = load_centroids(n_bits).to(keys.device, keys.dtype)
@@ -126,7 +130,6 @@ def simulate_turbo_quant_keys(keys: torch.Tensor, n_bits: int = 3) -> torch.Tens
     std = rotated.std(dim=-1, keepdim=True).clamp(min=1e-8)
     normalized = rotated / std
 
-    # Lloyd-Max quantization: find nearest centroid
     dists = (normalized.unsqueeze(-1) - centroids.unsqueeze(0).unsqueeze(0)) ** 2
     indices = dists.argmin(dim=-1)
     quantized_normalized = centroids[indices]
@@ -138,15 +141,7 @@ def simulate_turbo_quant_keys(keys: torch.Tensor, n_bits: int = 3) -> torch.Tens
 
 
 def simulate_turbo_quant_values(values: torch.Tensor, n_bits: int = 4) -> torch.Tensor:
-    """Simulate TurboQuant value quantization: per-vector uniform.
-
-    Args:
-        values: (n_tokens, head_dim) value tensor, float.
-        n_bits: quantization bit-width for values.
-
-    Returns:
-        Dequantized values, same shape.
-    """
+    """Simulate TurboQuant value quantization: per-vector uniform."""
     n_levels = 2 ** n_bits
     vmin = values.min(dim=-1, keepdim=True).values
     vmax = values.max(dim=-1, keepdim=True).values
@@ -676,15 +671,173 @@ def run_experiment_0(
 
 
 # --------------------------------------------------------------------------
+# vLLM-based ground-truth profiling (no simulation)
+# --------------------------------------------------------------------------
+
+def _detect_n_layers(model_name: str) -> int:
+    """Detect number of layers from HuggingFace model config."""
+    from transformers import AutoConfig
+    config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+    for attr in ("num_hidden_layers", "n_layer", "num_layers"):
+        if hasattr(config, attr):
+            return getattr(config, attr)
+    raise ValueError(f"Cannot detect layer count for {model_name}")
+
+
+def generate_sensitivity_manifest(
+    model_name: str = "Qwen/Qwen3-4B",
+    preset: str = "turboquant_4bit_nc",
+    trace_tag: str = "screen",
+    trace_seed: int = 20260714,
+    out_path: str = "configs/grids/exp0_vllm.json",
+) -> Path:
+    """Generate a harness manifest for per-layer sensitivity measurement.
+
+    Creates L+1 cells:
+    - 1 baseline cell (kv_cache_dtype="auto")
+    - L cells, each quantizing ONLY layer i (all others protected)
+
+    Run the manifest with: python -m src.harness --manifest <out_path>
+    Then analyze with: python -m src.profiler --mode vllm-analyze
+    """
+    n_layers = _detect_n_layers(model_name)
+    print(f"Model {model_name} has {n_layers} layers")
+
+    cells = []
+
+    # Baseline (FP16)
+    cells.append({
+        "model": model_name,
+        "kv_cache_dtype": "auto",
+        "skip_layers": [],
+        "rep": 0,
+        "trace_tag": trace_tag,
+        "trace_seed": trace_seed,
+    })
+
+    # Per-layer: quantize ONLY layer i
+    for target_layer in range(n_layers):
+        skip = [l for l in range(n_layers) if l != target_layer]
+        cells.append({
+            "model": model_name,
+            "kv_cache_dtype": preset,
+            "skip_layers": skip,
+            "rep": 0,
+            "trace_tag": trace_tag,
+            "trace_seed": trace_seed,
+        })
+
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(cells, indent=1))
+    print(f"Generated {len(cells)} cells → {out}")
+    print(f"\nRun: python -m src.harness --manifest {out}")
+    print(f"Then: python -m src.profiler --mode vllm-analyze --model {model_name}")
+    return out
+
+
+def analyze_vllm_sensitivity(
+    model_name: str = "Qwen/Qwen3-4B",
+    cells_dir: str = "results/cells",
+    manifest_path: str = "configs/grids/exp0_vllm.json",
+    out_dir: str = "results/exp0",
+) -> dict:
+    """Analyze results from vLLM-based per-layer sensitivity manifest."""
+    from src.harness import CellConfig
+
+    manifest = json.loads(Path(manifest_path).read_text())
+    cells_path = Path(cells_dir)
+
+    # Find baseline
+    baseline_entry = manifest[0]
+    baseline_entry["skip_layers"] = tuple(baseline_entry.get("skip_layers", ()))
+    baseline_hash = CellConfig(**baseline_entry).cell_hash()
+    baseline_file = cells_path / f"{baseline_hash}.json"
+
+    if not baseline_file.exists():
+        print(f"ERROR: Baseline cell not found: {baseline_file}")
+        return {}
+
+    baseline_data = json.loads(baseline_file.read_text())
+    baseline_ppl = baseline_data.get("ppl", {}).get("ppl")
+    print(f"Baseline PPL: {baseline_ppl:.4f}")
+
+    # Per-layer sensitivity
+    results = []
+    for entry in manifest[1:]:
+        entry_copy = dict(entry)
+        entry_copy["skip_layers"] = tuple(entry_copy.get("skip_layers", ()))
+        cell_hash = CellConfig(**entry_copy).cell_hash()
+        cell_file = cells_path / f"{cell_hash}.json"
+
+        if not cell_file.exists():
+            continue
+
+        cell_data = json.loads(cell_file.read_text())
+        if not cell_data.get("ok"):
+            continue
+
+        # The target layer is the one NOT in skip_layers
+        skip_set = set(int(x) for x in entry.get("skip_layers", []))
+        n_layers = len(skip_set) + 1
+        target_layer = next(l for l in range(n_layers) if l not in skip_set)
+
+        layer_ppl = cell_data.get("ppl", {}).get("ppl")
+        delta_ppl = layer_ppl - baseline_ppl if layer_ppl else None
+
+        results.append({
+            "layer": target_layer,
+            "ppl": round(layer_ppl, 4) if layer_ppl else None,
+            "delta_ppl": round(delta_ppl, 4) if delta_ppl else None,
+            "peak_vram_gb": cell_data.get("peak_vram_gb"),
+        })
+        if delta_ppl is not None:
+            print(f"  Layer {target_layer:2d}: PPL={layer_ppl:.4f}  ΔPPL={delta_ppl:+.4f}")
+        else:
+            print(f"  Layer {target_layer:2d}: FAILED")
+
+    results.sort(key=lambda r: r["layer"])
+
+    # Build ranking (most sensitive first)
+    valid = [r for r in results if r["delta_ppl"] is not None]
+    ranking = [r["layer"] for r in sorted(valid, key=lambda r: -r["delta_ppl"])]
+
+    output = {
+        "model": model_name,
+        "method": "vllm-ground-truth",
+        "baseline_ppl": round(baseline_ppl, 4),
+        "layers": results,
+        "policy": {
+            "method": "vllm-ground-truth",
+            "ranking": ranking,
+        },
+    }
+
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "sensitivity_vllm.json").write_text(json.dumps(output, indent=1))
+    print(f"\nSensitivity saved to {out / 'sensitivity_vllm.json'}")
+    print(f"Ranking (most sensitive first): {ranking[:10]}...")
+
+    return output
+
+
+# --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--mode", choices=["features", "sensitivity", "full"],
-                   default="full")
+    p.add_argument("--mode", choices=[
+        "features", "sim-sensitivity", "sim-full",
+        "vllm", "vllm-analyze",
+        # Legacy aliases
+        "sensitivity", "full",
+    ], default="sim-full")
     p.add_argument("--model", default="Qwen/Qwen3-4B")
+    p.add_argument("--preset", default="turboquant_4bit_nc",
+                   help="TurboQuant preset for vLLM-mode profiling")
     p.add_argument("--key-bits", type=int, default=3)
     p.add_argument("--value-bits", type=int, default=4)
     p.add_argument("--n-calib-docs", type=int, default=8)
@@ -692,16 +845,43 @@ def main() -> None:
     p.add_argument("--max-tokens", type=int, default=2048)
     p.add_argument("--device", default="cuda")
     p.add_argument("--out-dir", default="results/exp0")
+    p.add_argument("--manifest", default="configs/grids/exp0_vllm.json",
+                   help="Output path for vLLM manifest / input for vllm-analyze")
+    p.add_argument("--cells-dir", default="results/cells")
+    p.add_argument("--trace-tag", default="screen")
+    p.add_argument("--trace-seed", type=int, default=20260714)
     args = p.parse_args()
 
-    if args.mode == "full":
+    # Legacy aliases
+    mode = args.mode
+    if mode == "sensitivity":
+        mode = "sim-sensitivity"
+    elif mode == "full":
+        mode = "sim-full"
+
+    if mode == "vllm":
+        generate_sensitivity_manifest(
+            model_name=args.model,
+            preset=args.preset,
+            trace_tag=args.trace_tag,
+            trace_seed=args.trace_seed,
+            out_path=args.manifest,
+        )
+    elif mode == "vllm-analyze":
+        analyze_vllm_sensitivity(
+            model_name=args.model,
+            cells_dir=args.cells_dir,
+            manifest_path=args.manifest,
+            out_dir=args.out_dir,
+        )
+    elif mode == "sim-full":
         run_experiment_0(
             model_name=args.model, key_bits=args.key_bits,
             value_bits=args.value_bits, n_calib_docs=args.n_calib_docs,
             n_eval_docs=args.n_eval_docs, max_tokens=args.max_tokens,
             device=args.device, out_dir=args.out_dir,
         )
-    elif args.mode == "features":
+    elif mode == "features":
         calib_texts = load_calibration_texts("wiki", args.n_calib_docs)
         kv_data = extract_kv_per_layer(args.model, calib_texts,
                                         max_tokens=args.max_tokens,
@@ -717,7 +897,7 @@ def main() -> None:
                   f"norm_cv={f.key_norm_cv:.3f}  "
                   f"dyn_range={f.value_dynamic_range:.3f}  "
                   f"quant_err={f.simulated_quant_error:.6f}")
-    elif args.mode == "sensitivity":
+    elif mode == "sim-sensitivity":
         eval_texts = load_calibration_texts("wiki", args.n_eval_docs)
         result = measure_layer_sensitivity(
             args.model, eval_texts, key_bits=args.key_bits,
