@@ -22,9 +22,11 @@ Not "how to compress better" (that's TurboQuant's job). Not "which layers to pro
 | Finding | Evidence | Implication |
 |---------|----------|-------------|
 | Preset selection dominates layer protection (4x) | Exp 1, INSIGHTS #30 | Focus on preset choice, not layer tuning |
-| Chat needs k8v4, RAG needs 4bit_nc, Batch needs 4bit_nc | Exp 2-3, INSIGHTS #37, #44 | No single default serves all workloads |
-| 3bit costs +3.4% on 4B but +54.6% on 1.7B | Exp 4, INSIGHTS #51 | Preset safety is model-dependent |
+| Optimal preset is workload-dependent | Exp 2-3, INSIGHTS #37, #44 | No single default serves all workloads |
+| Optimal preset is model-dependent | Exp 4 (4 models, 3 families) | Llama/Mistral tolerate 3bit; Qwen-1.7B needs k8v4 |
+| Larger models absorb quantization better | Exp 4 | Mistral-7B handles 3bit for RAG (dPPL +0.69%); Qwen-1.7B batch utility <1 |
 | k8v4 crashes on Ampere (RTX 3090) | Smoke test, INSIGHTS #6 | Preset feasibility is hardware-dependent |
+| TurboQuant incompatible with Gemma architecture | Exp 4 (Gemma-2-2B) | KV page size mismatch — compatibility is also architecture-dependent |
 | Naive 4bit_nc on chat exceeds quality threshold silently | Exp 3, INSIGHTS #45 | Users need guidance, not guessing |
 | Per-layer protection is marginal | Exp 1-3, INSIGHTS #46-47 | Negative result — layer protection doesn't beat positional |
 
@@ -32,7 +34,7 @@ Not "how to compress better" (that's TurboQuant's job). Not "which layers to pro
 
 ## What We Contribute
 
-1. **Empirical characterization** of TurboQuant's preset space across workloads, models, and hardware — first systematic study of this configuration space
+1. **Empirical characterization** of TurboQuant's preset space across workloads (3 profiles), models (4 models, 3 architecture families), and hardware — first systematic study of this configuration space
 2. **Workload-aware utility framework** — chat/RAG/batch each have different quality thresholds and performance weights. No existing paper (KVTuner, KVmix, RateQuant) considers workload
 3. **Practical decision tool** on unmodified stock vLLM — input: (model, GPU, workload) → output: recommended `--kv-cache-dtype` flags with evidence and rejected alternatives
 4. **Negative result on layer protection** — with explanation grounded in error propagation literature
@@ -109,9 +111,10 @@ Our own data confirms: preset selection has 4x more impact than layer protection
 - The framing "we optimize which layers to protect"
 
 ### What we KEEP as the main story
-- Workload-aware preset selection (chat→k8v4, RAG→4bit_nc, batch→4bit_nc)
-- Model-dependent sensitivity (16x difference between 4B and 1.7B)
+- Workload-aware preset selection (optimal preset varies by workload AND model)
+- Model-dependent sensitivity confirmed across 3 families (Qwen, Llama, Mistral)
 - Hardware-dependent feasibility (k8v4 crashes on Ampere)
+- Architecture-dependent compatibility (TurboQuant incompatible with Gemma)
 - Practical tool on stock vLLM
 
 ### What we REFRAME
@@ -137,8 +140,8 @@ Run 4bit_nc at output lengths 50, 100, 200, 500 tokens. If degradation grows wit
 - Working end-to-end pipeline (profiler → harness → tuner → advisor)
 
 ### What's thin
-1. **Only 2 models, same family (Qwen).** We claim "model-dependent" but only tested Qwen3-4B and Qwen3-1.7B. A professor will ask "what about Llama? Mistral?" Need at least one non-Qwen model. Exp 4 grid already has Llama-3.1-8B and Mistral-7B-v0.3 defined — just needs to run.
-2. **Only 1 primary GPU.** The "hardware-dependent" claim relies on a single observation (k8v4 crashes on 3090). Valid but thin. Acceptable for a course project since GPU access is limited.
+1. ~~**Only 2 models, same family (Qwen).**~~ **RESOLVED.** Exp 4 ran on 4 models across 3 families: Qwen3-4B, Qwen3-1.7B, Llama-3.1-8B, Mistral-7B-v0.3. Gemma-2-2B was attempted but TurboQuant is incompatible with its architecture (KV page size mismatch — itself a finding).
+2. **Only 1 primary GPU (RTX 4090).** The "hardware-dependent" claim relies on a single observation (k8v4 crashes on 3090). Valid but thin. Acceptable for a course project since GPU access is limited.
 3. **The advisor is a lookup table.** It can only recommend configs it has already profiled. Give it an unseen model → it has nothing to say. Could at least estimate risk based on model properties (parameter count, num_layers, architecture family).
 4. **No cost translation.** "2.25x compression" is abstract. "Saves $X per month" or "serves Y more concurrent users" is concrete. One paragraph with back-of-envelope math would make practical value tangible.
 
@@ -146,13 +149,13 @@ Run 4bit_nc at output lengths 50, 100, 200, 500 tokens. If degradation grows wit
 
 | Addition | Effort | Impact | Status |
 |----------|--------|--------|--------|
-| Run Exp 4 on Llama + Mistral | ~4 GPU-hours | **High** — validates "model-dependent" across families | Planned, grid defined |
+| Run Exp 4 on Llama + Mistral | ~4 GPU-hours | **High** — validates "model-dependent" across families | **DONE** (Llama, Mistral, Qwen-1.7B; Gemma incompatible) |
 | PPL vs output length experiment | ~1 GPU-hour | **Medium** — connects error propagation to workload | Not started |
 | Cost/capacity calculation in advisor output | ~2 hours code | **Medium** — makes practical value concrete | Not started |
 | System architecture diagram in report | ~1 hour | **Medium** — makes it look like a real system | Not started |
 | Decision heuristic for unseen models | ~3 hours code | **Medium** — makes advisor generalizable | Not started |
 
-**Critical path:** The Llama/Mistral runs are essential. Without cross-family validation, "model-dependent" is really "Qwen-size-dependent" — and a professor will catch that. Everything else is polish.
+**Critical path:** ~~The Llama/Mistral runs are essential.~~ **DONE.** Cross-family validation complete. Everything else is polish.
 
 ### The framing matters more than the mechanism
 
@@ -196,9 +199,17 @@ No visualization code exists. The report needs charts: utility per workload, PPL
 Tests exist for: profiler, profiles, harness, workloads. NO tests for `tuner.py` or `advisor.py`.
 **Fix:** Add `tests/test_tuner.py` (utility computation, r_mem formula, cell averaging) and `tests/test_advisor.py` (format_cli, format_python, load_configs).
 
-#### 6. No Exp 4 cross-family results yet (HIGH — critical for claims)
-The grid `configs/grids/exp4_all.json` defines Llama-3.1-8B, Gemma-2-2B, Mistral-7B-v0.3 but results don't exist in `results/`. Without cross-family validation, "model-dependent" = "Qwen-size-dependent."
-**Fix:** Run Exp 4 on cluster with at least Llama + Mistral. Add `analysis/exp4_cross_family.py` to compare.
+#### 6. ~~No Exp 4 cross-family results yet~~ — DONE
+Exp 4 completed on Llama-3.1-8B, Mistral-7B-v0.3, and Qwen3-1.7B. Gemma-2-2B incompatible with TurboQuant (KV page size mismatch in vLLM). Results confirm model-dependent preset selection across 3 architecture families.
+
+**Exp 4 results summary:**
+
+| Model | Chat | RAG | Batch | Key observation |
+|-------|------|-----|-------|-----------------|
+| Qwen3-4B | k8v4 | 4bit_nc | 4bit_nc | Original baseline (Exp 1-3) |
+| Qwen3-1.7B | k8v4 | k8v4 | k8v4 (U=0.99) | Small model barely benefits; batch is break-even |
+| Llama-3.1-8B | 4bit_nc | 4bit_nc | 3bit_nc | Tolerates aggressive compression |
+| Mistral-7B-v0.3 | 4bit_nc | 3bit_nc | 3bit_nc | Most compression-tolerant model |
 
 #### 7. No cost/capacity estimation (LOW-MEDIUM)
 The advisor outputs "2.25x compression" but not "serves X more concurrent users" or "saves $Y/month." Adding a back-of-envelope capacity calculation would make the practical value concrete.
@@ -214,15 +225,16 @@ Some internal comments and the tuner's Optuna study names still reference the ol
 
 ### Priority order for remaining work:
 
-1. **Run Exp 4 on Llama + Mistral** — without this, the model-dependent claim is weak
-2. **Make tuner model-agnostic** (N_LAYERS, FLOOR_LAYERS dynamic) — needed for Exp 4 anyway
-3. **Add GPU input to advisor + feasibility filtering** — completes the (model, GPU, workload) → config pipeline
-4. **Add tests for tuner + advisor** — 40% of grade is tests
-5. **Add plots module** — needed for report
-6. **Multi-model advisor support** — so the tool works across profiled models
+1. ~~**Run Exp 4 on Llama + Mistral**~~ — **DONE**
+2. ~~**Make tuner model-agnostic**~~ — **DONE** (Jad branch)
+3. ~~**Add GPU input to advisor + feasibility filtering**~~ — **DONE** (Jad branch)
+4. ~~**Add tests for tuner + advisor**~~ — **DONE** (Jad branch)
+5. ~~**Add plots module**~~ — **DONE** (Jad branch)
+6. ~~**Multi-model advisor support**~~ — **DONE** (Jad branch)
 7. **Cost/capacity estimation** — polish
 8. **PPL vs output length experiment** — bonus finding
 9. **Docstring cleanup** — cosmetic
+10. **Fix: tuner `load_cells` doesn't filter by model** — bug found during Exp 4 (workaround: per-model cells directories)
 
 ---
 
